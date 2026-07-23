@@ -316,6 +316,28 @@ public:
         return _writeJson(path, doc);
     }
 
+    // ─── Raw JSON write (used by the web UI) ─────────────────────────────
+    // Validates that the body parses as JSON, then overwrites the file.
+    // Removes first so a shorter payload can't leave stale trailing bytes.
+    bool writeRawJson(const char* path, const String& body) {
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) {
+            Serial.printf("[SD] writeRawJson: invalid JSON for %s\n", path);
+            return false;
+        }
+        if (SD.exists(path)) SD.remove(path);
+        File f = SD.open(path, FILE_WRITE);
+        if (!f) {
+            Serial.printf("[SD] writeRawJson: cannot open %s\n", path);
+            return false;
+        }
+        size_t n = f.print(body);
+        f.close();
+        return n == body.length();
+    }
+
+    bool fileExists(const char* path) { return SD.exists(path); }
+
     // ─── First-Run Setup Detection ───────────────────────────────────────
 
     bool isFirstRun() {

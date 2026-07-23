@@ -11,14 +11,16 @@ ESP32 firmware for an RFID chore station. Hardware: **E32R40T** (ESP32-WROOM-32E
 This project **migrated off PlatformIO to the Arduino IDE** for easier maintenance — the flat `ChoreStation/*.h` + `.ino` layout is the Arduino sketch structure, and there is intentionally **no `platformio.ini`**. Do not reintroduce PlatformIO layout (`src/`, `platformio.ini`, `lib_deps`). Build is the **Arduino IDE** flow (`ARDUINO_IDE_SETUP.md`):
 
 - Board: **ESP32 Dev Module**, 240MHz, 4MB flash, Default 4MB w/ spiffs, upload 921600.
-- Libraries: **TFT_eSPI** (Bodmer 2.5.x), **MFRC522** (miguelbalboa 1.4.x), **ArduinoJson** (7.x). SD is in the ESP32 core.
+- Libraries: **TFT_eSPI** (Bodmer 2.5.x), **MFRC522** (miguelbalboa 1.4.x), **ArduinoJson** (7.x). SD, WiFi, and **WebServer** (the parent web UI) are all in the ESP32 core — no extra library for the web server (deliberately not AsyncWebServer, to avoid new deps).
 - **Critical:** copy this repo's `User_Setup.h` over the one inside the installed TFT_eSPI library folder. Pin/driver defines live there, NOT in the sketch. White screen after flash = this step was skipped.
 - Serial Monitor at **115200** for boot logs. RC522 firmware version prints at boot (0x92 good; 0x00/0xFF = wiring wrong).
 - CLI equivalent: `arduino-cli compile --fqbn esp32:esp32:esp32 ChoreStation` then `... upload -p <port>`. No CI, no tests — verification is on-device.
 
 ## Architecture
 
-Header-only modules. `ChoreStation.ino` includes every `.h` and owns all globals + UI. Each `.h` is a self-contained class (`RFIDManager`, `StorageManager`, `TaskEngine`, `Scheduler`, `BackupManager`, `TimeManager`, `DisplayPower`, `SetupWizard`, `ParentAdmin`, `AudioFeedback`, `RoutineManager`). No `.cpp` files.
+Header-only modules. `ChoreStation.ino` includes every `.h` and owns all globals + UI. Each `.h` is a self-contained class (`RFIDManager`, `StorageManager`, `TaskEngine`, `Scheduler`, `BackupManager`, `TimeManager`, `DisplayPower`, `SetupWizard`, `ParentAdmin`, `AudioFeedback`, `RoutineManager`, `WebUI`). No `.cpp` files.
+
+- **Web UI** (`web_server.h`) runs an ESP32-core `WebServer` on port 80, reachable once WiFi is up (the home screen prints the URL). It serves a one-page editor (HTML/JS in PROGMEM) plus a JSON API that reads/writes the SAME SD files the firmware uses — `GET/POST /api/routines` ↔ `/config/routines.json`, `GET/POST /api/tasks` ↔ `/tasks/recurring.json`, `GET /api/family` for assignee names. Saves are validated by `StorageManager::writeRawJson` (parse-check then remove-and-overwrite) and raise `web.pendingTaskReload` / `web.pendingRoutineReload`; the main loop consumes those and calls `scheduler.begin()` / `routines.begin()` so edits apply without a reboot. No auth — trusted-LAN tool, same threat model as the SD card; WiFi creds are never served. The page's field↔JSON contract is regression-tested host-side with jsdom (see scratchpad test), asserting emitted keys match the storage loaders.
 
 - **Routines** (`routine_manager.h`) are ordered checklists done under ONE scan (bedtime, get-ready-for-school). Scan → dashboard → tap the routine card → check off each step on-screen → flat bundle of points on full completion. No per-step RFID scan. Templates in `/config/routines.json`; per-day completion is a `doneMask` (bit per member) persisted to `/stats/routines.json` and cleared at the day rollover by `Scheduler::performDailyReset`. Surfaced as dashboard cards for children (highlighted gold during their `[startHour,endHour]` window, which may wrap midnight). Offline (no NTP), only daily (`recurDays==127`) routines surface. Dashboard rows (routines + tasks) are built by one shared `buildDashRows()` used by both draw and touch so taps always match drawn cards.
 
@@ -47,4 +49,4 @@ SD layout (`SDCard_Contents/` is the seed): `/config/wifi.json` (WiFi + timezone
 
 ## Not Yet Built
 
-Touch calibration (per-unit XPT2046 values), custom/free-text task names, voice input, mobile companion app, collaborative tasks, on-device WiFi picker, on-device routine editing (routines are hand-edited JSON for now — a parent web UI is the planned editor).
+Touch calibration (per-unit XPT2046 values), on-device custom/free-text task names (the web UI now covers custom names from a phone), voice input, native mobile companion app (the on-device web UI covers LAN editing), collaborative tasks, on-device WiFi picker.

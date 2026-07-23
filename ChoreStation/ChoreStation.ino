@@ -31,6 +31,7 @@
 #include "routine_manager.h"
 #include "scheduler.h"
 #include "parent_admin.h"
+#include "web_server.h"
 #include "preset_names.h"
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ TimeManager    timeMan;
 RoutineManager routines;
 Scheduler      scheduler;
 ParentAdmin    admin;
+WebUI          web;
 
 FamilyMember  family[MAX_FAMILY_MEMBERS];
 uint8_t       familyCount = 0;
@@ -178,6 +180,7 @@ void setup() {
         routines.begin();
         scheduler.begin();
         if (activeTaskCount == 0) scheduler.generateRecurringTasks();
+        web.begin();   // parent web editor (reachable once WiFi is up)
         goHome();
     }
     audio.scanBeep(); lastActivityMs = millis();
@@ -271,6 +274,20 @@ void loop() {
     timeMan.update();
     if (scheduler.update()) {
         if (currentScreen == Screen::DASHBOARD) drawDashboard();
+    }
+
+    // Web editor: serve requests, then apply any saves without a reboot.
+    web.handle();
+    if (web.pendingRoutineReload) {
+        web.pendingRoutineReload = false;
+        routines.begin();
+        if (currentScreen == Screen::DASHBOARD) drawDashboard();
+        Serial.println("[WEB] Routines reloaded from edit.");
+    }
+    if (web.pendingTaskReload) {
+        web.pendingTaskReload = false;
+        scheduler.begin();   // reload recurring templates
+        Serial.println("[WEB] Recurring templates reloaded from edit.");
     }
 
     delay(10);
@@ -1071,6 +1088,13 @@ void drawHome() {
         tft.setTextColor(C_PRI); tft.setTextSize(1);
         tft.setCursor(80+sx, 388+sy);
         tft.printf("%d awaiting approval", pa);
+    }
+
+    // WiFi / web-editor address (parents point a phone browser here)
+    if (WiFi.status() == WL_CONNECTED) {
+        tft.setTextColor(C_TXT3); tft.setTextSize(1);
+        tft.setCursor(60+sx, 430+sy);
+        tft.printf("Edit chores: http://%s", WiFi.localIP().toString().c_str());
     }
 
     tft.drawFastHLine(0, 455, 320, C_CARD);

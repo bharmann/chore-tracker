@@ -118,6 +118,11 @@ See `data/tasks/recurring.json` for a complete example. Key fields:
 4. Tap the teal "+" for quick ad-hoc task creation (3 taps: category, name, assign)
 5. Tap the gear icon → full admin (create recurring tasks, manage tasks, adjust goals)
 
+### Web editor (from your phone)
+When the station is on WiFi, the home screen shows a URL like `http://192.168.1.50`. Open it in any browser on the same network to add/edit **chores** and **routines** with a real keyboard — custom names, schedules, steps, points, assignees. Saves write straight to the SD card and apply live (no reboot). It edits the same files you could hand-edit: `/tasks/recurring.json` and `/config/routines.json`.
+
+> Security: the editor has no password — it's meant for your home LAN only, the same trust level as physical access to the SD card. WiFi credentials are never shown or served. Don't port-forward the station to the internet.
+
 ### Core Rule
 Any tag scan from any screen goes to that person's dashboard. No exceptions. This means twins can alternate freely — scan, do your thing, walk away. The other twin scans and sees her own dashboard instantly.
 
