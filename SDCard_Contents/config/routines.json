@@ -1,0 +1,36 @@
+{
+  "routines": [
+    {
+      "id": 1,
+      "name": "School Morning",
+      "assigned": 254,
+      "points": 5,
+      "startHour": 6,
+      "endHour": 8,
+      "recurDays": 62,
+      "steps": [
+        "Get dressed",
+        "Eat breakfast",
+        "Brush teeth",
+        "Pack backpack",
+        "Shoes on"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Bedtime",
+      "assigned": 254,
+      "points": 5,
+      "startHour": 19,
+      "endHour": 22,
+      "recurDays": 127,
+      "steps": [
+        "Put on pajamas",
+        "Brush teeth",
+        "Tidy your room",
+        "Clothes ready for tomorrow",
+        "Story time"
+      ]
+    }
+  ]
+}
