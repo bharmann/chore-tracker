@@ -50,10 +50,16 @@ public:
     };
 
     void begin() {
-        // Configure LEDC PWM for backlight
-        // Channel 0, 5000 Hz, 8-bit resolution
+        // Configure LEDC PWM for backlight — 5000 Hz, 8-bit resolution.
+        // esp32 core 3.x replaced ledcSetup+ledcAttachPin with a single
+        // ledcAttach(pin, freq, res) and made ledcWrite address the PIN, not
+        // the channel. Guard so the sketch builds on both 2.x and 3.x cores.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        ledcAttach(PIN_LCD_BL, 5000, 8);
+#else
         ledcSetup(_pwmChannel, 5000, 8);
         ledcAttachPin(PIN_LCD_BL, _pwmChannel);
+#endif
 
         setBrightness(BRIGHT_FULL);
         _state = State::ACTIVE;
@@ -161,7 +167,11 @@ public:
     // Direct brightness control (for settings UI)
     void setBrightness(uint8_t level) {
         _brightness = level;
-        ledcWrite(_pwmChannel, level);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        ledcWrite(PIN_LCD_BL, level);   // 3.x: write by pin
+#else
+        ledcWrite(_pwmChannel, level);  // 2.x: write by channel
+#endif
     }
 
     // Configure night mode hours
