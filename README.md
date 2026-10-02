@@ -1,8 +1,8 @@
 # Family Chore Station
 
 **Hardware:** E32R40T (ESP32-32E + ST7796 4" TFT) + RFID-RC522  
-**Framework:** Arduino via PlatformIO  
-**Project Size:** ~4,660 lines across 16 source files
+**Framework:** Arduino (Arduino IDE / arduino-cli; migrated off PlatformIO)  
+**Project Size:** ~7,400 lines across 18 source files
 
 ## What It Does
 
@@ -22,10 +22,12 @@ Family members scan personal RFID tags to identify themselves, view their assign
 | MISO      | GPIO19    | SPI 4-pin       |
 | RST       | GPIO25    | I2C 4-pin       |
 | IRQ       | GPIO32    | I2C 4-pin (optional) |
-| VCC       | 3.3V      | Any power pin   |
-| GND       | GND       | Any ground      |
+| VCC       | **3.3V**  | Any power pin (**not** 5V) |
+| GND       | GND       | Any ground (**required**)  |
 
-The RC522 shares the VSPI bus with the SD card. Both have separate CS pins so they coexist without conflict.
+The RC522 shares the VSPI bus with the SD card. Both have separate CS pins so they coexist without conflict. The display and touch have their own bus (HSPI); `User_Setup.h` must keep `USE_HSPI_PORT` or the display library takes over the RC522's bus and tags stop being detected after boot.
+
+The SPI 4-pin socket has **no power or ground pins**, so take 3.3V and GND from another header. The RC522 reads **13.56 MHz** tags only (MIFARE / NTAG); 125 kHz fobs won't register. See the RFID troubleshooting in `ARDUINO_IDE_SETUP.md`.
 
 ## SD Card Setup
 
@@ -33,8 +35,10 @@ Format a MicroSD card as FAT32 and create this structure:
 
 ```
 /config/
-  wifi.json       ← Your WiFi credentials + timezone
-  family.json     ← Created by setup wizard on first boot
+  wifi.json       ← Your WiFi credentials + timezone (+ optional webPin)
+  family.json     ← Created by setup wizard on first boot (don't pre-copy one)
+  routines.json   ← Routine checklists (also editable from the web editor)
+  touch.json      ← Auto-created by touch calibration
 /tasks/
   recurring.json  ← Your recurring task templates
 /logs/            ← Auto-created, daily completion logs
@@ -52,7 +56,8 @@ Open `/config/wifi.json` in any text editor and replace the placeholder values w
   "ssid": "YourWiFiNetwork",
   "password": "YourWiFiPassword",
   "gmtOffset": -28800,
-  "dstOffset": 3600
+  "dstOffset": 3600,
+  "webPin": ""
 }
 ```
 
@@ -62,6 +67,7 @@ Open `/config/wifi.json` in any text editor and replace the placeholder values w
 - `password` — Your WiFi password (supports WPA2-PSK)
 - `gmtOffset` — Seconds from UTC for your timezone (see table below)
 - `dstOffset` — Usually 3600 (1 hour) if your area uses daylight saving, 0 if not
+- `webPin` — Optional. If set, the phone web editor asks for a login (user `parent`, password = this PIN)
 
 **Common timezone offsets:**
 
@@ -81,23 +87,27 @@ If your WiFi password or network changes later, pull the SD card, edit the file,
 
 ### recurring.json (your task templates)
 
-See `data/tasks/recurring.json` for a complete example. Key fields:
+See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use the web editor). Key fields:
 
 - `recurDays`: Bitmask for days of week. bit0=Sun, bit1=Mon, ..., bit6=Sat. 127=every day, 62=Mon-Fri, 64=Sat only.
 - `minTime`: Minimum seconds between start and complete scan (e.g., 120 for 2-minute tooth brushing).
 - `timeout`: Auto-abort after this many seconds (0 = no timeout).
-- `assigned`: Family member ID (0-based, matches registration order). 255 = unassigned.
+- `assigned`: Family member ID (0-based, matches registration order). 255 = anyone (first child to start it claims it), 254 = every child gets their own copy.
 
 ## First Boot
 
 1. Insert SD card with `wifi.json` and `recurring.json`
 2. Connect E32R40T via USB-C
 3. Flash via Arduino IDE: open `ChoreStation/ChoreStation.ino` and click Upload (see `ARDUINO_IDE_SETUP.md`)
-4. The setup wizard appears:
+4. Touch calibration (once): tap each corner arrow as it appears
+5. The setup wizard appears:
    - Scan parent tag(s) → pick names
    - Scan child tag(s) → pick names
    - Review and save
    - Device reboots into normal mode
+6. Rename people to their real names from the web editor's **Family** tab (the wizard only offers preset names)
+
+**Lost or new tags, or touch way off?** Press and hold the BOOT button while "Starting..." shows to open **recovery mode**: re-pair tags (keeps names and points) or recalibrate touch. Admin → Family Settings → "Re-pair tags" does the same from a parent's dashboard. An unregistered tag shows "Unknown tag" plus its ID, and the web editor's Family tab can assign it with one tap.
 
 ## Daily Operation
 
@@ -119,9 +129,13 @@ See `data/tasks/recurring.json` for a complete example. Key fields:
 5. Tap the gear icon → full admin (create recurring tasks, manage tasks, adjust goals)
 
 ### Web editor (from your phone)
-When the station is on WiFi, the home screen shows a URL like `http://192.168.1.50`. Open it in any browser on the same network to add/edit **chores** and **routines** with a real keyboard — custom names, schedules, steps, points, assignees. Saves write straight to the SD card and apply live (no reboot). It edits the same files you could hand-edit: `/tasks/recurring.json` and `/config/routines.json`.
+When the station is on WiFi, the home screen shows a URL like `http://192.168.1.50`. Open it in any browser on the same network to edit:
+- **Chores** and **routines**, with a real keyboard: custom names, schedules, steps, points, assignees.
+- **Family**: names, daily goals, and tag IDs. "Use last scan" fills in the most recent unregistered tag.
 
-> Security: the editor has no password — it's meant for your home LAN only, the same trust level as physical access to the SD card. WiFi credentials are never shown or served. Don't port-forward the station to the internet.
+Saves write straight to the SD card and apply live (no reboot). Chores and routines are the same files you could hand-edit: `/tasks/recurring.json` and `/config/routines.json`. Existing items keep their ids when you save, so today's progress isn't disturbed.
+
+> Security: set `webPin` in `wifi.json` to require a login; without it anyone on your WiFi (kids included) can edit chores. WiFi credentials are never shown or served. Don't port-forward the station to the internet.
 
 ### Core Rule
 Any tag scan from any screen goes to that person's dashboard. No exceptions. This means twins can alternate freely — scan, do your thing, walk away. The other twin scans and sees her own dashboard instantly.
@@ -130,23 +144,27 @@ Any tag scan from any screen goes to that person's dashboard. No exceptions. Thi
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `ChoreStation.ino` | 1,246 | Boot, main loop, all screens, scan/touch routing, actions |
-| `parent_admin.h` | 920 | Task creation wizard, task management, settings, system info |
-| `backup_manager.h` | 548 | Write coalescing, shadow copies, daily backups, log archiving |
-| `setup_wizard.h` | 497 | First-run family registration flow |
-| `task_engine.h` | 378 | Task state machine, point calculator, completion logging |
+| `ChoreStation.ino` | 1,839 | Boot, main loop, all screens, scan/touch routing, tag pairing, recovery |
+| `parent_admin.h` | 1,102 | Task creation wizard, task management, settings, system info |
+| `backup_manager.h` | 551 | Write coalescing, shadow copies, daily backups, log archiving |
+| `setup_wizard.h` | 521 | First-run family registration flow |
+| `storage_manager.h` | 444 | SD card JSON persistence (with .bak fallback), touch calibration |
+| `web_server.h` | 420 | Phone web editor: chores, routines, family + tags |
+| `task_engine.h` | 380 | Task state machine, point calculator, completion logging |
 | `milestones.h` | 328 | 16 collectible badge definitions + collection screen |
 | `icons.h` | 314 | On-screen icons drawn via TFT primitives |
-| `storage_manager.h` | 290 | SD card JSON persistence layer |
-| `scheduler.h` | 253 | Recurring task generation + daily reset + streak evaluation |
-| `time_manager.h` | 243 | WiFi + NTP time sync |
-| `display_power.h` | 210 | PWM backlight dimming, sleep, anti-burn-in pixel shift |
-| `data_model.h` | 181 | All structs and enums |
-| `rfid_manager.h` | 119 | RC522 RFID reader with debounce |
+| `time_manager.h` | 284 | WiFi + NTP time sync (non-blocking after boot) |
+| `scheduler.h` | 280 | Recurring task generation + daily reset + streak evaluation |
+| `display_power.h` | 220 | PWM backlight dimming, sleep, anti-burn-in pixel shift |
+| `data_model.h` | 208 | All structs and enums |
+| `rfid_manager.h` | 175 | RC522 reader: debounce, health check + auto-recovery |
+| `routine_manager.h` | 139 | Routine checklists (bedtime / school mornings) |
 | `pins.h` | 89 | GPIO pin assignments (single source of truth) |
 | `audio_feedback.h` | 78 | DAC tone generation for scan/complete/error |
-| `User_Setup.h` | — | TFT_eSPI pin/driver config (copy into the library folder) |
 | `preset_names.h` | 23 | Shared task name presets (6 per category) |
+| `User_Setup.h` | — | TFT_eSPI pin/driver config (copy into the library folder) |
+
+Host-side tests: `test/web_ui_contract.test.js` (jsdom) checks the web editor against the firmware's JSON loaders. CI (`.github/workflows/build.yml`) compiles the firmware and runs that test on every push.
 
 ## Key Design Decisions
 
@@ -165,9 +183,8 @@ Any tag scan from any screen goes to that person's dashboard. No exceptions. Thi
 
 ## What's Not Built Yet
 
-- **Touch calibration** — XPT2046 needs per-unit calibration values (run TFT_eSPI calibration example)
-- **Custom task names** — preset lists cover common tasks; free-text would need on-screen keyboard
+- **On-device custom task names** — the touchscreen offers presets; custom names come from the web editor
 - **Voice input** — would need an I2S MEMS microphone module (INMP441)
-- **Mobile companion app** — for remote task creation, notifications, dashboard
+- **Notifications / remote dashboard** — the web editor covers LAN editing, but nothing pushes "task waiting for approval" to a phone yet
 - **Collaborative tasks** — joint tasks where both children work together on one item
 - **On-device WiFi picker** — credentials edited in wifi.json on SD card before first boot

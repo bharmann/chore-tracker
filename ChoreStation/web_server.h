@@ -1,29 +1,33 @@
 // =============================================================================
-// web_server.h — Parent Web UI for editing Chores & Routines
+// web_server.h — Parent Web UI for editing Chores, Routines & Family
 // =============================================================================
 // The touchscreen is fine for kids scanning and tapping, but painful for a
 // parent authoring tasks (preset names only, no keyboard, resistive touch).
 // This module runs a small HTTP server on the ESP32 (only reachable once WiFi
 // is up) so a parent can open the station's IP in a phone browser and edit
-// recurring chores and routines with real forms and a keyboard.
+// recurring chores, routines and family members with real forms and a keyboard.
 //
 // Data contract: the API reads and writes the SAME SD JSON files the firmware
 // already uses — /tasks/recurring.json and /config/routines.json — so there is
 // one source of truth. On a successful save the module raises a reload flag;
 // the main loop reloads the affected module (scheduler / routines) so changes
-// take effect without a reboot.
+// take effect without a reboot. Family edits go straight into the in-RAM
+// family[] (names, goals, tag UIDs) and are saved immediately.
 //
 // Endpoints:
 //   GET  /               → the single-page editor (HTML/JS, served from PROGMEM)
-//   GET  /api/family     → members (id, name, role) for assignee dropdowns
+//   GET  /api/family     → members (id, name, role, dailyGoal, uid, points)
+//   POST /api/family     → update names / goals / tag UIDs, or add members
+//   GET  /api/lastscan   → the most recent tag that matched nobody
 //   GET  /api/routines   → current /config/routines.json
 //   POST /api/routines   → replace /config/routines.json (validated)
 //   GET  /api/tasks      → current /tasks/recurring.json
 //   POST /api/tasks      → replace /tasks/recurring.json (validated)
 //
-// Scope note: no authentication — this is a trusted-home-LAN tool, same threat
-// model as the SD card itself. WiFi credentials are never served. If exposed
-// beyond the LAN this would need auth; documented as a known limitation.
+// Auth: optional. If /config/wifi.json has "webPin", every request needs HTTP
+// Basic auth (user "parent", password = the PIN). Without it the editor is
+// open to anyone on the LAN — fine for a trusted home network, but the kids
+// are on that network too. WiFi credentials are never served.
 // =============================================================================
 
 #pragma once
@@ -31,12 +35,19 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SD.h>
+#include <ArduinoJson.h>
 #include "data_model.h"
 #include "storage_manager.h"
+#include "backup_manager.h"
+#include "rfid_manager.h"
 
 extern StorageManager storage;
+extern BackupManager  backups;
 extern FamilyMember   family[];
 extern uint8_t        familyCount;
+extern uint8_t        lastUnknownUid[];
+extern uint8_t        lastUnknownLen;
+extern uint32_t       lastUnknownMs;
 
 class WebUI {
 public:
@@ -44,18 +55,22 @@ public:
     // running firmware picks up edited templates/routines without a reboot.
     bool pendingTaskReload    = false;
     bool pendingRoutineReload = false;
+    bool familyChanged        = false;   // main loop redraws name-bearing screens
 
-    void begin() {
-        _server.on("/", HTTP_GET, [this]() { _handleRoot(); });
-        _server.on("/api/family",   HTTP_GET,  [this]() { _handleFamily(); });
-        _server.on("/api/routines", HTTP_GET,  [this]() { _streamFile("/config/routines.json", "{\"routines\":[]}"); });
-        _server.on("/api/routines", HTTP_POST, [this]() { _handleSave("/config/routines.json", pendingRoutineReload); });
-        _server.on("/api/tasks",    HTTP_GET,  [this]() { _streamFile("/tasks/recurring.json", "{\"tasks\":[]}"); });
-        _server.on("/api/tasks",    HTTP_POST, [this]() { _handleSave("/tasks/recurring.json", pendingTaskReload); });
+    void begin(const char* pin) {
+        strlcpy(_pin, pin ? pin : "", sizeof(_pin));
+        _server.on("/", HTTP_GET, [this]() { if (_auth()) _handleRoot(); });
+        _server.on("/api/family",   HTTP_GET,  [this]() { if (_auth()) _handleFamily(); });
+        _server.on("/api/family",   HTTP_POST, [this]() { if (_auth()) _handleFamilySave(); });
+        _server.on("/api/lastscan", HTTP_GET,  [this]() { if (_auth()) _handleLastScan(); });
+        _server.on("/api/routines", HTTP_GET,  [this]() { if (_auth()) _streamFile("/config/routines.json", "{\"routines\":[]}"); });
+        _server.on("/api/routines", HTTP_POST, [this]() { if (_auth()) _handleSave("/config/routines.json", "routines", pendingRoutineReload); });
+        _server.on("/api/tasks",    HTTP_GET,  [this]() { if (_auth()) _streamFile("/tasks/recurring.json", "{\"tasks\":[]}"); });
+        _server.on("/api/tasks",    HTTP_POST, [this]() { if (_auth()) _handleSave("/tasks/recurring.json", "tasks", pendingTaskReload); });
         _server.onNotFound([this]() { _server.send(404, "text/plain", "Not found"); });
         _server.begin();
         _started = true;
-        Serial.println("[WEB] Server started on port 80.");
+        Serial.printf("[WEB] Server started on port 80 (%s).\n", _pin[0] ? "PIN required" : "no PIN");
     }
 
     // Call every loop; cheap when idle.
@@ -68,6 +83,25 @@ public:
 private:
     WebServer _server{80};
     bool      _started = false;
+    char      _pin[33] = "";
+
+    bool _auth() {
+        if (!_pin[0] || _server.authenticate("parent", _pin)) return true;
+        _server.requestAuthentication(BASIC_AUTH, "Chore Station", "PIN required");
+        return false;
+    }
+
+    void _sendJson(int code, JsonDocument& doc) {
+        String out;
+        serializeJson(doc, out);
+        _server.send(code, "application/json", out);
+    }
+
+    void _sendError(int code, const char* msg) {
+        JsonDocument doc;
+        doc["error"] = msg;
+        _sendJson(code, doc);
+    }
 
     void _streamFile(const char* path, const char* fallback) {
         File f = SD.open(path, FILE_READ);
@@ -76,35 +110,100 @@ private:
         f.close();
     }
 
-    void _handleSave(const char* path, bool& reloadFlag) {
-        if (!_server.hasArg("plain")) {
-            _server.send(400, "application/json", "{\"error\":\"empty body\"}");
-            return;
-        }
+    void _handleSave(const char* path, const char* arrayKey, bool& reloadFlag) {
+        if (!_server.hasArg("plain")) { _sendError(400, "empty body"); return; }
         String body = _server.arg("plain");
-        if (storage.writeRawJson(path, body)) {
+        if (storage.writeRawJson(path, body, arrayKey)) {
             reloadFlag = true;
             _server.send(200, "application/json", "{\"ok\":true}");
             Serial.printf("[WEB] Saved %s (%u bytes)\n", path, (unsigned)body.length());
         } else {
-            _server.send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+            _sendError(400, "invalid JSON");
         }
     }
 
     void _handleFamily() {
-        String out = "{\"members\":[";
+        JsonDocument doc;
+        JsonArray arr = doc["members"].to<JsonArray>();
         for (uint8_t i = 0; i < familyCount; i++) {
-            if (i) out += ",";
-            out += "{\"id\":";
-            out += (int)family[i].id;
-            out += ",\"name\":\"";
-            out += family[i].name;
-            out += "\",\"role\":\"";
-            out += (family[i].role == Role::PARENT) ? "parent" : "child";
-            out += "\"}";
+            JsonObject m = arr.add<JsonObject>();
+            m["id"]        = family[i].id;
+            m["name"]      = family[i].name;
+            m["role"]      = (family[i].role == Role::PARENT) ? "parent" : "child";
+            m["dailyGoal"] = family[i].dailyGoal;
+            m["points"]    = family[i].totalPoints;
+            char hex[UID_LENGTH * 3 + 1];
+            RFIDManager::uidToHex(family[i].rfidUid, family[i].rfidUidLength, hex, sizeof(hex));
+            m["uid"] = hex;
         }
-        out += "]}";
-        _server.send(200, "application/json", out);
+        doc["max"] = MAX_FAMILY_MEMBERS;
+        _sendJson(200, doc);
+    }
+
+    void _handleLastScan() {
+        JsonDocument doc;
+        char hex[UID_LENGTH * 3 + 1] = "";
+        if (lastUnknownLen) RFIDManager::uidToHex(lastUnknownUid, lastUnknownLen, hex, sizeof(hex));
+        doc["uid"] = hex;
+        doc["ageSec"] = lastUnknownLen ? (millis() - lastUnknownMs) / 1000 : 0;
+        _sendJson(200, doc);
+    }
+
+    // Edit names / goals / tags of existing members, or append new ones.
+    // Members can't be deleted here: ids are array positions and every task
+    // assignment refers to them.
+    void _handleFamilySave() {
+        if (!_server.hasArg("plain")) { _sendError(400, "empty body"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, _server.arg("plain")) || !doc["members"].is<JsonArray>()) {
+            _sendError(400, "invalid JSON"); return;
+        }
+
+        // Validate everything into a copy first; apply only if all of it is good.
+        FamilyMember next[MAX_FAMILY_MEMBERS];
+        memcpy(next, family, sizeof(next));
+        uint8_t nextCount = familyCount;
+
+        for (JsonObject m : doc["members"].as<JsonArray>()) {
+            int id = m["id"] | -1;
+            FamilyMember* fm;
+            if (id >= 0 && id < familyCount) {
+                fm = &next[id];
+            } else {
+                if (nextCount >= MAX_FAMILY_MEMBERS) { _sendError(400, "family is full"); return; }
+                fm = &next[nextCount];
+                memset(fm, 0, sizeof(FamilyMember));
+                fm->id = nextCount;
+                fm->role = (strcmp(m["role"] | "child", "parent") == 0) ? Role::PARENT : Role::CHILD;
+                fm->dailyGoal = (fm->role == Role::CHILD) ? 5 : 3;
+                nextCount++;
+            }
+            const char* name = m["name"] | "";
+            if (name[0]) strlcpy(fm->name, name, NAME_LENGTH);
+            if (!fm->name[0]) { _sendError(400, "every member needs a name"); return; }
+            int goal = m["dailyGoal"] | (int)fm->dailyGoal;
+            fm->dailyGoal = constrain(goal, 1, 20);
+            const char* uid = m["uid"] | "";
+            uint8_t parsed[UID_LENGTH];
+            uint8_t len = StorageManager::parseHexUid(uid, parsed);
+            if (uid[0] && len == 0) { _sendError(400, "tag must look like 04:A2:3B:C1"); return; }
+            memcpy(fm->rfidUid, parsed, len);
+            fm->rfidUidLength = len;
+        }
+
+        for (uint8_t i = 0; i < nextCount; i++)
+            for (uint8_t j = i + 1; j < nextCount; j++)
+                if (next[i].rfidUidLength && RFIDManager::matchUid(next[i].rfidUid, next[i].rfidUidLength, next[j])) {
+                    _sendError(400, "the same tag is assigned twice"); return;
+                }
+
+        memcpy(family, next, sizeof(next));
+        familyCount = nextCount;
+        backups._shadowCopy("/config/family.json");
+        if (!storage.saveFamily(family, familyCount)) { _sendError(500, "SD write failed"); return; }
+        familyChanged = true;
+        _server.send(200, "application/json", "{\"ok\":true}");
+        Serial.printf("[WEB] Family saved (%u members)\n", familyCount);
     }
 
     void _handleRoot() {
@@ -139,6 +238,9 @@ textarea{min-height:96px;resize:vertical}
 .days{display:flex;gap:4px}.days button{flex:1;padding:8px 0;border:none;border-radius:6px;background:#0e1218;color:var(--dim);font-weight:700;cursor:pointer}
 .days button.on{background:var(--pri);color:#fff}
 .del{background:var(--err);border:none;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;float:right}
+.use{background:#2c3644;border:none;color:#fff;padding:8px 10px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.scan{background:#0e1218;border:1px dashed var(--warn);border-radius:8px;padding:10px;margin-bottom:10px;font-size:14px}
+.role{float:right;font-size:12px;color:var(--dim);text-transform:uppercase}
 .bar{position:sticky;bottom:0;background:var(--bg);padding:10px 0;display:flex;gap:8px}
 .btn{flex:1;padding:12px;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;color:#fff}
 .add{background:#2c3644}.save{background:var(--ok)}
@@ -150,23 +252,28 @@ textarea{min-height:96px;resize:vertical}
 <div class="tabs">
   <div class="tab on" id="tabR" onclick="show('R')">Routines</div>
   <div class="tab" id="tabC" onclick="show('C')">Chores</div>
+  <div class="tab" id="tabF" onclick="show('F')">Family</div>
 </div>
 <div id="listR"></div>
 <div id="listC" style="display:none"></div>
+<div id="paneF" style="display:none">
+  <div class="scan" id="scan">Scan a tag on the station to see its ID here.</div>
+  <div id="listF"></div>
+</div>
 <div class="bar">
   <button class="btn add" onclick="add()">+ Add</button>
   <button class="btn save" onclick="save()">Save changes</button>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-var fam=[], cur='R';
+var fam=[], cur='R', lastUid='';
 var DAYS=['Su','Mo','Tu','We','Th','Fr','Sa'];
 var CATS=['Cleaning','Health','Family','Academic','Pet Care','Outdoor'];
 var SIZES=['Small','Medium','Large'];
 
-function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.className='toast on';setTimeout(function(){t.className='toast'},1800)}
-function show(t){cur=t;document.getElementById('tabR').className='tab'+(t=='R'?' on':'');document.getElementById('tabC').className='tab'+(t=='C'?' on':'');document.getElementById('listR').style.display=t=='R'?'':'none';document.getElementById('listC').style.display=t=='C'?'':'none'}
+function show(t){cur=t;['R','C','F'].forEach(function(k){document.getElementById('tab'+k).className='tab'+(t==k?' on':'')});document.getElementById('listR').style.display=t=='R'?'':'none';document.getElementById('listC').style.display=t=='C'?'':'none';document.getElementById('paneF').style.display=t=='F'?'':'none'}
 
 function assignOpts(v,withAll){
   var o='<option value="255"'+(v==255?' selected':'')+'>Anyone</option>';
@@ -183,7 +290,7 @@ function tday(b,i){var d=b.parentNode,m=+d.dataset.mask;m^=(1<<i);d.dataset.mask
 
 function routineCard(r){
   r=r||{name:'',assigned:254,points:5,startHour:19,endHour:22,recurDays:127,steps:[]};
-  return '<div class="card" data-k="R">'
+  return '<div class="card" data-k="R" data-id="'+(r.id||0)+'">'
    +'<button class="del" onclick="this.parentNode.remove()">Delete</button>'
    +'<label>Name</label><input class="f-name" value="'+esc(r.name)+'">'
    +'<div class="row"><div><label>Who</label><select class="f-assigned">'+assignOpts(r.assigned,true)+'</select></div>'
@@ -199,12 +306,12 @@ function choreCard(t){
   var co='',so='';
   CATS.forEach(function(c,i){co+='<option value="'+i+'"'+(t.cat==i?' selected':'')+'>'+c+'</option>'});
   SIZES.forEach(function(s,i){so+='<option value="'+i+'"'+(t.size==i?' selected':'')+'>'+s+'</option>'});
-  return '<div class="card" data-k="C">'
+  return '<div class="card" data-k="C" data-id="'+(t.id||0)+'">'
    +'<button class="del" onclick="this.parentNode.remove()">Delete</button>'
    +'<label>Name</label><input class="f-name" value="'+esc(t.name)+'">'
    +'<div class="row"><div><label>Category</label><select class="f-cat">'+co+'</select></div>'
    +'<div><label>Size</label><select class="f-size">'+so+'</select></div></div>'
-   +'<div class="row"><div><label>Who</label><select class="f-assigned">'+assignOpts(t.assigned,false)+'</select></div>'
+   +'<div class="row"><div><label>Who</label><select class="f-assigned">'+assignOpts(t.assigned,true)+'</select></div>'
    +'<div><label>Approval?</label><select class="f-approval"><option value="0"'+(!t.approval?' selected':'')+'>No</option><option value="1"'+(t.approval?' selected':'')+'>Yes</option></select></div></div>'
    +'<div class="row"><div><label>Min sec</label><input class="f-minTime" type="number" value="'+(t.minTime||0)+'"></div>'
    +'<div><label>Timeout sec</label><input class="f-timeout" type="number" value="'+(t.timeout||0)+'"></div></div>'
@@ -213,8 +320,34 @@ function choreCard(t){
    +'<div><label>Minute</label><input class="f-recurMin" type="number" min="0" max="59" value="'+(t.recurMin||0)+'"></div></div>'
    +'</div>';
 }
+function memberCard(m){
+  var isNew=!m; m=m||{id:-1,name:'',role:'child',dailyGoal:5,uid:'',points:0};
+  return '<div class="card" data-k="F" data-id="'+m.id+'">'
+   +(isNew?'<select class="f-role" style="width:auto;float:right"><option value="child">Child</option><option value="parent">Parent</option></select>'
+          :'<span class="role">'+esc(m.role)+' &middot; '+(m.points||0)+' pts</span>')
+   +'<label>Name</label><input class="f-name" maxlength="15" value="'+esc(m.name)+'">'
+   +'<div class="row"><div><label>Daily goal</label><input class="f-goal" type="number" min="1" max="20" value="'+(m.dailyGoal||5)+'"></div>'
+   +'<div style="flex:2"><label>Tag ID</label><div class="row"><input class="f-uid" placeholder="04:A2:3B:C1" value="'+esc(m.uid)+'">'
+   +'<button type="button" class="use" onclick="useScan(this)">Use last scan</button></div></div></div>'
+   +'</div>';
+}
 
-function add(){var l=document.getElementById('list'+cur);l.insertAdjacentHTML('beforeend',cur=='R'?routineCard():choreCard())}
+function add(){
+  if(cur=='F'){document.getElementById('listF').insertAdjacentHTML('beforeend',memberCard());return}
+  var l=document.getElementById('list'+cur);l.insertAdjacentHTML('beforeend',cur=='R'?routineCard():choreCard());
+}
+function useScan(b){
+  if(!lastUid){toast('Scan an unregistered tag on the station first');return}
+  b.parentNode.querySelector('.f-uid').value=lastUid;toast('Tag filled in - press Save');
+}
+
+// Keep existing ids (the station tracks today's progress by id); give new
+// items the next free id.
+function assignIds(out,cards,base){
+  var used=out.map(function(o,i){return +cards[i].dataset.id||0}).filter(Boolean);
+  var next=Math.max.apply(null,[base].concat(used));
+  out.forEach(function(o,i){var id=+cards[i].dataset.id||0;o.id=id||++next});
+}
 
 function collect(){
   var cards=document.querySelectorAll('#list'+cur+' .card'),out=[];
@@ -229,23 +362,46 @@ function collect(){
       out.push({id:0,name:g('f-name').value,cat:+g('f-cat').value,size:+g('f-size').value,type:0,state:0,
         assigned:+g('f-assigned').value,creator:0,minTime:+g('f-minTime').value,timeout:+g('f-timeout').value,
         approval:g('f-approval').value=='1',ownMess:false,childClaimed:false,parentOverride:false,
-        noRemApproved:false,noRemToggle:false,recurDays:mask,recurHour:+g('f-recurHour').value,recurMin:+g('f-recurMin').value});
+        noRemApproved:false,noRemToggle:false,recurDays:mask,recurHour:+g('f-recurHour').value,recurMin:+g('f-recurMin').value,
+        startEpoch:0});
     }
   });
-  // Assign stable-ish ids
-  out.forEach(function(o,i){o.id=(cur=='R')?(i+1):(2000+i)});
+  assignIds(out,cards,cur=='R'?0:2000);
+  return out;
+}
+function collectFamily(){
+  var out=[];
+  document.querySelectorAll('#listF .card').forEach(function(c){
+    var g=function(s){return c.querySelector('.'+s)};
+    var m={id:+c.dataset.id,name:g('f-name').value.trim(),dailyGoal:+g('f-goal').value,uid:g('f-uid').value.trim()};
+    if(g('f-role'))m.role=g('f-role').value;
+    out.push(m);
+  });
   return out;
 }
 
-function save(){
-  var items=collect();
-  var body=(cur=='R')?{routines:items}:{tasks:items};
-  fetch(cur=='R'?'/api/routines':'/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(function(r){return r.json()}).then(function(j){toast(j.ok?'Saved!':'Error: '+(j.error||'?'))})
+function post(url,body,after){
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json()}).then(function(j){toast(j.ok?'Saved!':'Error: '+(j.error||'?'));if(j.ok&&after)after()})
     .catch(function(){toast('Network error')});
+}
+function save(){
+  if(cur=='F'){post('/api/family',{members:collectFamily()},loadFamily);return}
+  var items=collect();
+  post(cur=='R'?'/api/routines':'/api/tasks',(cur=='R')?{routines:items}:{tasks:items});
 }
 
 function render(id,arr,fn){document.getElementById(id).innerHTML=arr.map(fn).join('')}
+function loadFamily(){
+  return fetch('/api/family').then(function(r){return r.json()}).then(function(j){fam=j.members||[];render('listF',fam,memberCard)});
+}
+function pollScan(){
+  fetch('/api/lastscan').then(function(r){return r.json()}).then(function(j){
+    if(!j||!j.uid)return;
+    lastUid=j.uid;
+    document.getElementById('scan').innerHTML='Last unregistered tag: <b>'+esc(j.uid)+'</b> ('+(j.ageSec||0)+'s ago). Tap "Use last scan" on a person, then Save.';
+  }).catch(function(){});
+}
 
 Promise.all([
   fetch('/api/family').then(function(r){return r.json()}),
@@ -255,8 +411,10 @@ Promise.all([
   fam=res[0].members||[];
   render('listR',(res[1].routines||[]),routineCard);
   render('listC',(res[2].tasks||[]),choreCard);
+  render('listF',fam,memberCard);
   document.getElementById('ip').textContent='Editing on '+location.host;
 }).catch(function(){toast('Load failed')});
+pollScan();setInterval(pollScan,3000);
 </script>
 </body></html>
 )HTML";

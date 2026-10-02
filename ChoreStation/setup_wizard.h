@@ -65,6 +65,12 @@ public:
             handleScan(uid, uidLen);
         }
 
+        // Reader status changed (e.g. just wired up) → refresh the prompt
+        if (rfid.isOnline() != _readerOnline) {
+            _readerOnline = rfid.isOnline();
+            if (_step == Step::SCAN_PARENT || _step == Step::SCAN_CHILD) drawCurrentStep();
+        }
+
         // Poll touch
         uint16_t tx, ty;
         if (tft.getTouch(&tx, &ty)) {
@@ -87,6 +93,7 @@ private:
     uint8_t       _parentsDone;
     uint8_t       _childrenDone;
     uint8_t       _selectedNameIdx;
+    bool          _readerOnline = false;
 
     // Temporary storage for the tag just scanned
     uint8_t       _pendingUid[UID_LENGTH];
@@ -172,6 +179,8 @@ private:
         tft.print("You'll register each family member");
         tft.setCursor(30, 345);
         tft.print("by scanning their RFID tag.");
+        tft.setCursor(30, 360);
+        tft.print("Names can be changed later in the web editor.");
 
         // "Begin" button
         _drawButton(85, 400, 150, 45, "BEGIN", 0x2C9F);
@@ -189,9 +198,17 @@ private:
         tft.setTextColor(0x7BCF);
         tft.setTextSize(1);
         tft.setCursor(30, 90);
-        tft.printf("%s #%d — hold tag near reader", roleLabel, num);
+        tft.printf("%s #%d - hold tag near reader", roleLabel, num);
 
-        Icons::drawRfidIcon(136, 160, 0x2C9F, 48);
+        Icons::drawRfidIcon(136, 160, rfid.isOnline() ? 0x2C9F : 0xF800, 48);
+        if (!rfid.isOnline()) {
+            tft.setTextColor(0xF800);
+            tft.setTextSize(1);
+            tft.setCursor(30, 265);
+            tft.print("Tag reader offline - check RC522 wiring");
+            tft.setCursor(30, 279);
+            tft.print("(3.3V, GND, RST). Retrying every 5 s.");
+        }
 
         // Scanning animation hint
         tft.setTextColor(0x4A69);
@@ -304,7 +321,7 @@ private:
         if (_step == Step::SCAN_PARENT || _step == Step::SCAN_CHILD) {
             // Check for duplicate
             for (uint8_t i = 0; i < _memberCount; i++) {
-                if (memcmp(uid, _members[i].rfidUid, uidLen) == 0) {
+                if (RFIDManager::matchUid(uid, uidLen, _members[i])) {
                     audio.errorTone();
                     tft.setTextColor(0xF800);
                     tft.setTextSize(1);
@@ -465,7 +482,14 @@ private:
             _members[i].dailyGoal = (_members[i].role == Role::CHILD) ? 5 : 3;
         }
 
-        storage.saveFamily(_members, _memberCount);
+        if (!storage.saveFamily(_members, _memberCount)) {
+            // Restarting now would just loop back into the wizard
+            audio.errorTone();
+            tft.fillRect(0, 380, 320, 30, 0x1082);
+            tft.setTextColor(0xF800); tft.setTextSize(1);
+            tft.setCursor(20, 390); tft.print("Could not save to the SD card - check it, then SAVE.");
+            return;
+        }
         Serial.printf("[SETUP] Saved %d family members to SD.\n", _memberCount);
 
         _step = Step::COMPLETE;

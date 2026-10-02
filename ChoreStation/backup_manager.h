@@ -334,7 +334,10 @@ public:
         while ((entry = dir.openNextFile())) {
             if (entry.isDirectory()) { entry.close(); continue; }
 
-            const char* fname = entry.name();
+            // ESP32 core 2.x+: name() is the bare filename; path() is the
+            // absolute path that SD.open()/remove() need.
+            String fullPath = entry.path();
+            const char* fname = fullPath.c_str();
             const char* slash = strrchr(fname, '/');
             const char* name = slash ? slash + 1 : fname;
 

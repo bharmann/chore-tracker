@@ -119,6 +119,8 @@ struct Task {
 
     uint32_t    startedAtMs;          // millis() when scan-to-start happened
     uint32_t    completedAtMs;        // millis() when scan-to-complete happened
+    uint32_t    startedEpoch;         // wall-clock start (0 = unknown); persisted so
+                                      // in-progress timers survive a reboot
     uint16_t    minimumTimeSec;       // Minimum seconds between start and complete
     uint16_t    timeoutTimeSec;       // Auto-abort after this many seconds (0=none)
 

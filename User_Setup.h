@@ -24,6 +24,14 @@
 #define TFT_WIDTH  320
 #define TFT_HEIGHT 480
 
+// ─── SPI Port ────────────────────────────────────────────────────────────────
+// REQUIRED. Without this, TFT_eSPI creates its own SPIClass on the VSPI
+// peripheral — the bus the RC522 and SD card use. tft.init() then re-routes
+// VSPI's MISO input to GPIO12, so after boot the RC522 reads garbage (no tags
+// ever detected) and SD reads fail, even though the display looks fine.
+// ChoreStation.ino refuses to compile if this is missing.
+#define USE_HSPI_PORT
+
 // ─── SPI Pins (HSPI bus — dedicated to LCD + touch) ─────────────────────────
 #define TFT_MISO  12
 #define TFT_MOSI  13

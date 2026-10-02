@@ -34,6 +34,16 @@
 #include "web_server.h"
 #include "preset_names.h"
 
+// TFT_eSPI reads its pin config from the User_Setup.h inside the LIBRARY folder,
+// not this sketch. A stale copy there builds fine but breaks the hardware, so
+// refuse to compile instead.
+#if !defined(USE_HSPI_PORT)
+#error "TFT_eSPI would share the RC522/SD bus (RFID goes deaf after boot). Copy this repo's User_Setup.h into the TFT_eSPI library folder - see ARDUINO_IDE_SETUP.md."
+#endif
+#if !defined(TOUCH_CS) || !defined(ST7796_DRIVER)
+#error "TFT_eSPI is not configured for the E32R40T. Copy this repo's User_Setup.h into the TFT_eSPI library folder - see ARDUINO_IDE_SETUP.md."
+#endif
+
 // ─── Globals ─────────────────────────────────────────────────────────────────
 
 TFT_eSPI       tft;
@@ -66,7 +76,22 @@ bool     inSetupMode    = false;
 bool     msgActive      = false;
 uint32_t msgExpireMs    = 0;
 char     msgText[48]    = "";
+char     msgSub[40]     = "";   // optional small second line
 uint16_t msgColor       = 0;
+
+// Last tag that matched nobody — shown on screen and offered by the web UI's
+// Family tab so a parent can assign it without the setup wizard.
+uint8_t  lastUnknownUid[UID_LENGTH];
+uint8_t  lastUnknownLen = 0;
+uint32_t lastUnknownMs  = 0;
+
+bool     lastRfidOnline = false;   // redraw status when the reader comes/goes
+bool     timersNeedRestore = false; // in-progress timers loaded from SD
+
+// Tag pairing (re-assign tags to existing members, keeps names + points)
+uint8_t  pairIdx = 0;
+bool     bootHeld = false;          // BOOT button held at power-up → recovery
+uint32_t lastSdRetryMs = 0;
 
 // Self-init wizard state (child proposing a task)
 bool     selfInitActive = false;
@@ -86,7 +111,8 @@ uint32_t detailShownAtMs = 0;
 
 enum class Screen : uint8_t {
     HOME, DASHBOARD, TASK_DETAIL, SELF_INIT, QUICK_ADD,
-    PARENT_ADMIN, MILESTONES, ROUTINE, SETUP
+    PARENT_ADMIN, MILESTONES, ROUTINE, SETUP,
+    NO_SD, PAIR_TAGS, RECOVERY
 };
 Screen currentScreen = Screen::HOME;
 
@@ -143,7 +169,22 @@ void touchSelfInit(uint16_t x, uint16_t y);
 void touchQuickAdd(uint16_t x, uint16_t y);
 
 void showMsg(const char* msg, uint16_t color, uint16_t durationMs = 1200);
+void showMsg2(const char* msg, const char* sub, uint16_t color, uint16_t durationMs);
 void drawMsgOverlay();
+void redrawCurrent();
+
+void drawNoSd();
+void goPairTags();
+void drawPairTags();
+void handlePairScan(uint8_t* uid, uint8_t len);
+void touchPairTags(uint16_t x, uint16_t y);
+void finishPairing();
+void goRecovery();
+void drawRecovery();
+void touchRecovery(uint16_t x, uint16_t y);
+void runTouchCalibration();
+void restoreTaskTimers();
+bool canStartTask(const Task& t, uint8_t memberId);
 
 bool isVisibleTask(uint8_t idx);
 uint8_t totalPages();
@@ -159,29 +200,62 @@ void setup() {
     Serial.begin(115200); delay(500);
     Serial.println("\n══ Family Chore Station v5 ══\n");
 
+    // BOOT (GPIO0) pressed while "Starting..." shows opens the recovery screen
+    // (re-pair tags, recalibrate touch). NOT held during power-on: GPIO0 low at
+    // reset puts the ESP32 into its flashing bootloader instead.
+    pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
+
     audio.begin();
     SPI.begin(PIN_VSPI_CLK, PIN_VSPI_MISO, PIN_VSPI_MOSI);
     bool sdOk = storage.begin();
     rfid.begin();
+    lastRfidOnline = rfid.isOnline();
     tft.init(); tft.setRotation(0); tft.fillScreen(C_BG);
     display.begin();
 
+    if (!sdOk) {
+        // Nothing works without the card (config, family, tasks). Say so
+        // plainly and keep retrying instead of dropping into the setup wizard,
+        // which can't save without it anyway.
+        currentScreen = Screen::NO_SD;
+        drawNoSd();
+        lastActivityMs = millis();
+        return;
+    }
+
+    // Touch calibration is per-unit; run it once (or on request) and keep the
+    // result on the SD card. Every tap target depends on it.
+    uint16_t cal[5];
+    if (storage.loadTouchCal(cal)) tft.setTouch(cal);
+    else runTouchCalibration();
+
+    tft.fillScreen(C_BG);
     tft.setTextColor(C_PRI); tft.setTextSize(2);
     tft.setCursor(80, 220); tft.print("Starting...");
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(55, 260); tft.print("Hold BOOT now for recovery mode");
+    uint32_t splashMs = millis();
+    while (millis() - splashMs < 1500 && !bootHeld) {
+        bootHeld = (digitalRead(PIN_BOOT_BUTTON) == LOW);
+        delay(20);
+    }
 
-    if (sdOk) timeMan.begin();
+    timeMan.begin();   // may take up to 15 s while WiFi connects
+    if (digitalRead(PIN_BOOT_BUTTON) == LOW) bootHeld = true;
     backups.begin();
 
-    if (!sdOk || storage.isFirstRun()) {
+    if (storage.isFirstRun()) {
         inSetupMode = true; currentScreen = Screen::SETUP; wizard.begin();
     } else {
         storage.loadFamily(family, familyCount);
         storage.loadTasks(activeTasks, activeTaskCount, "/tasks/active.json");
+        timersNeedRestore = true;
         routines.begin();
         scheduler.begin();
         if (activeTaskCount == 0) scheduler.generateRecurringTasks();
-        web.begin();   // parent web editor (reachable once WiFi is up)
-        goHome();
+        web.begin(timeMan.webPin());   // parent web editor (reachable once WiFi is up)
+        if (bootHeld) goRecovery();
+        else          goHome();
     }
     audio.scanBeep(); lastActivityMs = millis();
 }
@@ -191,6 +265,21 @@ void setup() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void loop() {
+    if (currentScreen == Screen::NO_SD) {
+        // Retry the mount; a clean restart is the simplest way to bring every
+        // module up in the right order once the card is in.
+        if (millis() - lastSdRetryMs > 2000) {
+            lastSdRetryMs = millis();
+            if (storage.begin()) {
+                Serial.println("[SD] Card found — restarting.");
+                delay(200);
+                ESP.restart();
+            }
+        }
+        delay(10);
+        return;
+    }
+
     if (inSetupMode) {
         if (wizard.update()) {
             inSetupMode = false;
@@ -201,12 +290,37 @@ void loop() {
         return;
     }
 
-    // RFID — always polls, always goes to dashboard
+    // RFID — always polls, always goes to dashboard (pairing mode excepted)
     uint8_t uid[UID_LENGTH]; uint8_t uidLen = 0;
     if (rfid.poll(uid, uidLen)) {
         display.wake();
-        handleScan(uid, uidLen);
+        if (currentScreen == Screen::PAIR_TAGS) handlePairScan(uid, uidLen);
+        else                                    handleScan(uid, uidLen);
     }
+
+    // Reader came online / dropped out: refresh screens that show its status
+    if (rfid.isOnline() != lastRfidOnline) {
+        lastRfidOnline = rfid.isOnline();
+        if (currentScreen == Screen::HOME || currentScreen == Screen::PAIR_TAGS) redrawCurrent();
+    }
+
+    // Recovery screen: the BOOT button picks touch calibration, in case the
+    // touch screen is too far off to hit the on-screen button.
+    // Only a fresh press counts: the press that opened recovery may still be held.
+    static bool bootArmed = false;
+    if (currentScreen == Screen::RECOVERY) {
+        bool down = (digitalRead(PIN_BOOT_BUTTON) == LOW);
+        if (!down) bootArmed = true;
+        else if (bootArmed) {
+            bootArmed = false;
+            runTouchCalibration();
+            drawRecovery();
+        }
+    } else {
+        bootArmed = false;
+    }
+
+    if (timersNeedRestore && timeMan.isTimeSynced()) restoreTaskTimers();
 
     // Touch
     uint16_t tx, ty;
@@ -240,9 +354,7 @@ void loop() {
         // Non-blocking message expiry
         if (msgActive && millis() >= msgExpireMs) {
             msgActive = false;
-            // Redraw current screen to clear overlay
-            if (currentScreen == Screen::DASHBOARD) drawDashboard();
-            else if (currentScreen == Screen::HOME) drawHome();
+            redrawCurrent();   // clear the overlay
         }
 
         // Auto-return from task detail
@@ -289,6 +401,10 @@ void loop() {
         scheduler.begin();   // reload recurring templates
         Serial.println("[WEB] Recurring templates reloaded from edit.");
     }
+    if (web.familyChanged) {
+        web.familyChanged = false;
+        if (currentScreen == Screen::HOME || currentScreen == Screen::DASHBOARD) redrawCurrent();
+    }
 
     delay(10);
 }
@@ -331,8 +447,15 @@ void handleScan(uint8_t* uid, uint8_t len) {
         if (RFIDManager::matchUid(uid, len, family[i])) { mid = i; break; }
 
     if (mid < 0) {
+        // Remember it so a parent can assign it from the web UI (Family tab),
+        // and show the UID so it can also be typed into family.json.
+        memcpy(lastUnknownUid, uid, len);
+        lastUnknownLen = len;
+        lastUnknownMs = millis();
+        char hex[UID_LENGTH * 3 + 1];
+        RFIDManager::uidToHex(uid, len, hex, sizeof(hex));
         audio.errorTone();
-        showMsg("Unknown tag", C_ERR);
+        showMsg2("Unknown tag", hex, C_ERR, 2500);
         return;
     }
 
@@ -342,7 +465,7 @@ void handleScan(uint8_t* uid, uint8_t len) {
     if (currentScreen == Screen::TASK_DETAIL && viewingTaskIdx >= 0 && mid == currentUserId) {
         Task& task = activeTasks[viewingTaskIdx];
 
-        if (mid == task.assignedTo && task.state == TaskState::AVAILABLE) {
+        if (canStartTask(task, mid)) {   // startTask claims "Anyone" tasks
             // Start task, then go to dashboard
             TransitionResult r = TaskEngine::startTask(task, mid);
             if (r.success) {
@@ -397,7 +520,7 @@ void handleTouch(uint16_t x, uint16_t y) {
     audio.touchClick();
 
     // Dismiss message overlay on any touch
-    if (msgActive) { msgActive = false; drawDashboard(); return; }
+    if (msgActive) { msgActive = false; redrawCurrent(); return; }
 
     switch (currentScreen) {
         case Screen::HOME: break;
@@ -406,8 +529,11 @@ void handleTouch(uint16_t x, uint16_t y) {
         case Screen::ROUTINE:     touchRoutine(x, y); break;
         case Screen::SELF_INIT:   touchSelfInit(x, y); break;
         case Screen::QUICK_ADD:   touchQuickAdd(x, y); break;
+        case Screen::PAIR_TAGS:   touchPairTags(x, y); break;
+        case Screen::RECOVERY:    touchRecovery(x, y); break;
         case Screen::PARENT_ADMIN:
             if (admin.handleTouch(x, y)) goDashboard(currentUserId);
+            else if (admin.wantsPairTags) { admin.wantsPairTags = false; goPairTags(); }
             break;
         case Screen::MILESTONES:
             if (x < 50 && y < 55) goDashboard(currentUserId);
@@ -987,20 +1113,53 @@ void drawQuickAdd() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void showMsg(const char* msg, uint16_t color, uint16_t durationMs) {
+    showMsg2(msg, "", color, durationMs);
+}
+
+void showMsg2(const char* msg, const char* sub, uint16_t color, uint16_t durationMs) {
     msgActive = true;
     msgExpireMs = millis() + durationMs;
     strlcpy(msgText, msg, sizeof(msgText));
+    strlcpy(msgSub, sub, sizeof(msgSub));
     msgColor = color;
     drawMsgOverlay();
 }
 
 void drawMsgOverlay() {
     if (!msgActive) return;
-    tft.fillRoundRect(20, 210, 280, 40, 8, msgColor);
+    bool hasSub = msgSub[0] != '\0';
+    tft.fillRoundRect(20, 210, 280, hasSub ? 56 : 40, 8, msgColor);
     tft.setTextColor(C_TXT); tft.setTextSize(2);
     int16_t tw = strlen(msgText) * 12;
     tft.setCursor(max(30, 160 - tw/2), 218);
     tft.print(msgText);
+    if (hasSub) {
+        tft.setTextSize(1);
+        tw = strlen(msgSub) * 6;
+        tft.setCursor(max(30, 160 - tw/2), 246);
+        tft.print(msgSub);
+    }
+}
+
+// Redraw whatever screen is showing (used to clear overlays / refresh status).
+void redrawCurrent() {
+    switch (currentScreen) {
+        case Screen::HOME:         drawHome(); break;
+        case Screen::DASHBOARD:    drawDashboard(); break;
+        case Screen::TASK_DETAIL:  drawTaskDetail(); break;
+        case Screen::ROUTINE:      drawRoutine(); break;
+        case Screen::SELF_INIT:    drawSelfInit(); break;
+        case Screen::QUICK_ADD:    drawQuickAdd(); break;
+        case Screen::PARENT_ADMIN: admin.drawCurrentScreen(); break;
+        case Screen::MILESTONES:
+            if (currentUserId < familyCount) MilestoneIcons::drawCollection(family[currentUserId]);
+            else goHome();
+            break;
+        case Screen::PAIR_TAGS:    drawPairTags(); break;
+        case Screen::RECOVERY:     drawRecovery(); break;
+        case Screen::NO_SD:        drawNoSd(); break;
+        default: break;
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1013,7 +1172,16 @@ bool isVisibleTask(uint8_t idx) {
     if (currentUserId < familyCount && family[currentUserId].role == Role::PARENT) {
         return true; // Parent sees all active tasks
     }
+    // Children see their own tasks plus unclaimed "Anyone" tasks (the first
+    // child to start one claims it).
+    if (t.assignedTo == 255) return t.state == TaskState::AVAILABLE;
     return t.assignedTo == currentUserId;
+}
+
+// May this member scan-to-start this task? Own tasks, or unclaimed "Anyone".
+bool canStartTask(const Task& t, uint8_t memberId) {
+    if (t.state != TaskState::AVAILABLE) return false;
+    return t.assignedTo == memberId || t.assignedTo == 255;
 }
 
 // Build the ordered dashboard list shared by draw + touch.
@@ -1070,7 +1238,16 @@ void drawHome() {
     tft.setTextColor(C_TXT2); tft.setTextSize(2);
     tft.setCursor(55+sx, 200+sy); tft.print("Scan your tag");
 
-    Icons::drawRfidIcon(136+sx, 260+sy, C_PRI, 48);
+    Icons::drawRfidIcon(136+sx, 260+sy, rfid.isOnline() ? C_PRI : C_ERR, 48);
+
+    // Reader problems used to show only as a 3px dot — make them obvious.
+    if (!rfid.isOnline()) {
+        tft.fillRoundRect(15, 318+sy, 290, 40, 6, C_ERR);
+        tft.setTextColor(C_TXT); tft.setTextSize(2);
+        tft.setCursor(25+sx, 323+sy); tft.print("Tag reader offline");
+        tft.setTextSize(1);
+        tft.setCursor(25+sx, 343+sy); tft.print("Check RC522 wiring (3.3V, GND, RST)");
+    }
 
     // In-progress indicator
     uint8_t ip = 0;
@@ -1262,9 +1439,11 @@ void drawDashboard() {
         uint8_t pts = t.isOwnMess ? PointTable::ownMess(t.size) : PointTable::base(t.size);
         tft.printf("%s %dpt", sz[(int)t.size], pts);
 
-        // Assignee name (parent view)
+        // Assignee name (parent view); unclaimed tasks show "Anyone"
         if (isParent && t.assignedTo < familyCount) {
             tft.setCursor(110, yPos + 20); tft.print(family[t.assignedTo].name);
+        } else if (t.assignedTo == 255) {
+            tft.setCursor(110, yPos + 20); tft.print("Anyone");
         }
 
         // State indicator
@@ -1323,7 +1502,8 @@ void drawDashboard() {
 void drawTaskDetail() {
     if (viewingTaskIdx < 0 || viewingTaskIdx >= activeTaskCount) { goDashboard(currentUserId); return; }
     const Task& task = activeTasks[viewingTaskIdx];
-    bool isOwner = (currentUserId == task.assignedTo);
+    bool isOwner = (currentUserId == task.assignedTo) ||
+                   (task.assignedTo == 255 && task.state == TaskState::AVAILABLE);
     bool isParent = (currentUserId < familyCount && family[currentUserId].role == Role::PARENT);
     uint16_t cc = catC(task.category);
 
@@ -1363,7 +1543,7 @@ void drawTaskDetail() {
         int32_t rem = TaskEngine::remainingMinTime(task);
         if (rem > 0) {
             tft.setTextColor(C_TXT3); tft.setTextSize(1);
-            tft.setCursor(20, 162); tft.printf("Min: %ds left", rem);
+            tft.setCursor(20, 162); tft.printf("Min: %lds left", (long)rem);
         } else if (task.minimumTimeSec > 0) {
             tft.setTextColor(C_OK); tft.setTextSize(1);
             tft.setCursor(20, 162); tft.print("Ready to complete!");
@@ -1420,7 +1600,7 @@ void drawTaskDetail() {
         int32_t rem = TaskEngine::remainingMinTime(task);
         if (rem > 0) {
             tft.setTextColor(C_TXT3); tft.setTextSize(1);
-            tft.setCursor(40, ay); tft.print("Keep going — not enough time yet");
+            tft.setCursor(40, ay); tft.print("Keep going - not enough time yet");
         } else {
             tft.setTextColor(C_OK); tft.setTextSize(1);
             tft.setCursor(55, ay); tft.print("Scan your tag to complete");
@@ -1455,4 +1635,205 @@ void drawTaskDetail() {
         tft.setTextColor(C_ERR); tft.setTextSize(1);
         tft.setCursor(70, ay); tft.print("This task timed out.");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NO SD CARD — loop() retries the mount and restarts once the card is in
+// ═════════════════════════════════════════════════════════════════════════════
+
+void drawNoSd() {
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_ERR); tft.setTextSize(3);
+    tft.setCursor(40, 120); tft.print("No SD card");
+    tft.setTextColor(C_TXT2); tft.setTextSize(2);
+    tft.setCursor(20, 190); tft.print("Insert the CHORES");
+    tft.setCursor(20, 215); tft.print("card (FAT32) and");
+    tft.setCursor(20, 240); tft.print("wait a moment.");
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(20, 300); tft.print("The station restarts by itself once");
+    tft.setCursor(20, 314); tft.print("the card is readable.");
+    tft.setCursor(20, 340);
+    tft.printf("Tag reader: %s", rfid.isOnline() ? "OK" : "NOT DETECTED");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TAG PAIRING — assign a fresh tag to each existing member. Keeps names,
+// points and streaks (unlike the first-run wizard). Reached from the recovery
+// screen (hold BOOT at power-up) or Admin > Family Settings.
+// ═════════════════════════════════════════════════════════════════════════════
+
+void goPairTags() {
+    pairIdx = 0;
+    currentScreen = Screen::PAIR_TAGS;
+    lastActivityMs = millis();
+    drawPairTags();
+}
+
+void drawPairTags() {
+    if (pairIdx >= familyCount) { finishPairing(); return; }
+    const FamilyMember& m = family[pairIdx];
+
+    tft.fillScreen(C_BG);
+    tft.fillRect(0, 0, 320, 48, C_CARD);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(12, 14); tft.print("Pair Family Tags");
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(230, 20); tft.printf("%d of %d", pairIdx + 1, familyCount);
+
+    tft.setTextColor(C_TXT2); tft.setTextSize(2);
+    tft.setCursor(20, 80); tft.print("Scan the tag for:");
+    tft.setTextColor(m.role == Role::PARENT ? C_PRI : C_GOLD); tft.setTextSize(4);
+    tft.setCursor(20, 115); tft.print(m.name);
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(20, 160); tft.print(m.role == Role::PARENT ? "PARENT" : "CHILD");
+
+    char hex[UID_LENGTH * 3 + 1];
+    RFIDManager::uidToHex(m.rfidUid, m.rfidUidLength, hex, sizeof(hex));
+    tft.setCursor(20, 180); tft.printf("Current tag: %s", m.rfidUidLength ? hex : "(none)");
+
+    Icons::drawRfidIcon(136, 220, rfid.isOnline() ? C_PRI : C_ERR, 48);
+    if (!rfid.isOnline()) {
+        tft.setTextColor(C_ERR); tft.setTextSize(1);
+        tft.setCursor(20, 300); tft.print("Tag reader offline - check RC522 wiring.");
+    }
+
+    tft.fillRoundRect(15, 380, 290, 36, 6, C_CARD);
+    tft.setTextColor(C_TXT2); tft.setTextSize(2);
+    tft.setCursor(70, 390); tft.print("SKIP (keep tag)");
+    tft.fillRoundRect(15, 430, 290, 36, 6, C_OK);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(100, 440); tft.print("DONE / SAVE");
+}
+
+void handlePairScan(uint8_t* uid, uint8_t len) {
+    lastActivityMs = millis();
+    if (pairIdx >= familyCount) return;
+
+    // A tag can only belong to one person
+    for (uint8_t i = 0; i < familyCount; i++) {
+        if (i != pairIdx && RFIDManager::matchUid(uid, len, family[i])) {
+            audio.errorTone();
+            char buf[40]; snprintf(buf, sizeof(buf), "That's %s's tag", family[i].name);
+            showMsg(buf, C_ERR, 1500);
+            return;
+        }
+    }
+
+    memcpy(family[pairIdx].rfidUid, uid, len);
+    family[pairIdx].rfidUidLength = len;
+    backups.markFamilyDirty();
+    audio.scanBeep();
+    Serial.printf("[PAIR] %s paired to new tag\n", family[pairIdx].name);
+    pairIdx++;
+    if (pairIdx >= familyCount) finishPairing();
+    else drawPairTags();
+}
+
+void touchPairTags(uint16_t x, uint16_t y) {
+    lastActivityMs = millis();
+    if (y >= 380 && y <= 416) { pairIdx++; drawPairTags(); return; }   // skip
+    if (y >= 430 && y <= 466) { finishPairing(); return; }            // done
+}
+
+void finishPairing() {
+    backups.flushNow(activeTasks, activeTaskCount, family, familyCount,
+        [](const Task* t, uint8_t c, const char* p){ storage.saveTasks(t, c, p); },
+        [](const FamilyMember* f, uint8_t c){ storage.saveFamily(f, c); });
+    audio.taskCompleteTone();
+    goHome();
+    showMsg("Tags saved!", C_OK, 1500);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RECOVERY — hold BOOT while powering on. For when tags or touch don't work,
+// so the normal admin path (which needs a parent tag and taps) is unreachable.
+// ═════════════════════════════════════════════════════════════════════════════
+
+void goRecovery() {
+    currentScreen = Screen::RECOVERY;
+    drawRecovery();
+}
+
+void drawRecovery() {
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(20, 20); tft.print("Recovery");
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(20, 45); tft.print("Let go of BOOT, then pick an option.");
+
+    tft.fillRoundRect(15, 80, 290, 110, 10, C_PRI);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(35, 115); tft.print("Re-pair family tags");
+    tft.setTextSize(1);
+    tft.setCursor(35, 145); tft.print("Keeps names, points and streaks");
+
+    tft.fillRoundRect(15, 210, 290, 110, 10, C_CARD);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(35, 245); tft.print("Calibrate touch");
+    tft.setTextSize(1);
+    tft.setTextColor(C_TXT2);
+    tft.setCursor(35, 275); tft.print("Or press the BOOT button again");
+
+    tft.fillRoundRect(15, 400, 290, 50, 10, C_DIM);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(130, 417); tft.print("EXIT");
+
+    tft.setTextColor(C_TXT3); tft.setTextSize(1);
+    tft.setCursor(20, 345);
+    tft.printf("Reader: %s (0x%02X)", rfid.isOnline() ? "online" : "OFFLINE", rfid.version());
+    if (WiFi.status() == WL_CONNECTED) {
+        tft.setCursor(20, 360);
+        tft.printf("Web editor: http://%s", WiFi.localIP().toString().c_str());
+    }
+}
+
+void touchRecovery(uint16_t x, uint16_t y) {
+    if (y >= 80 && y <= 190)  { goPairTags(); return; }
+    if (y >= 210 && y <= 320) { runTouchCalibration(); drawRecovery(); return; }
+    if (y >= 400 && y <= 450) { goHome(); return; }
+}
+
+// TFT_eSPI's corner-arrow routine reads raw touch values, so it works no matter
+// how far off the current calibration is. Result is stored on the SD card.
+void runTouchCalibration() {
+    // Wait for BOOT to be released so the press that got us here isn't
+    // mistaken for anything else.
+    while (digitalRead(PIN_BOOT_BUTTON) == LOW) delay(10);
+
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(40, 190); tft.print("Touch calibration");
+    tft.setTextColor(C_TXT2); tft.setTextSize(1);
+    tft.setCursor(40, 220); tft.print("Touch each corner arrow as it");
+    tft.setCursor(40, 234); tft.print("appears (a stylus works best).");
+
+    uint16_t cal[5];
+    tft.calibrateTouch(cal, C_GOLD, C_BG, 15);
+    tft.setTouch(cal);
+    bool saved = storage.saveTouchCal(cal);
+    Serial.printf("[TOUCH] Calibrated: %u %u %u %u %u (%s)\n",
+                  cal[0], cal[1], cal[2], cal[3], cal[4], saved ? "saved" : "NOT saved");
+
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_OK); tft.setTextSize(2);
+    tft.setCursor(60, 220); tft.print("Touch calibrated");
+    delay(800);
+}
+
+// In-progress timers survive a reboot: tasks store the wall-clock start time,
+// and once NTP is up we rebuild the millis()-based start from it.
+void restoreTaskTimers() {
+    timersNeedRestore = false;
+    uint32_t now = timeMan.currentEpoch();
+    for (uint8_t i = 0; i < activeTaskCount; i++) {
+        Task& t = activeTasks[i];
+        if (t.state != TaskState::IN_PROGRESS || t.startedEpoch == 0 || t.startedEpoch > now) continue;
+        uint32_t elapsedS = now - t.startedEpoch;
+        t.startedAtMs = millis() - elapsedS * 1000UL;   // unsigned wrap is fine
+        Serial.printf("[TASK] Restored timer for '%s' (%lus elapsed)\n", t.name, (unsigned long)elapsedS);
+    }
+}
+
+void reloadRecurringTemplates() {
+    scheduler.begin();
 }

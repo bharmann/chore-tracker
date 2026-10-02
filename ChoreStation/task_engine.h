@@ -64,6 +64,7 @@ public:
 
         task.state = TaskState::IN_PROGRESS;
         task.startedAtMs = millis();
+        task.startedEpoch = timeMan.currentEpoch();   // 0 if NTP not synced
         task.noReminderToggled = false;
         task.childClaimedNoReminder = false;
         task.parentOverrodeReminder = false;
@@ -222,6 +223,7 @@ public:
 
         task.state = TaskState::AVAILABLE;  // Go back to queue
         task.startedAtMs = 0;
+        task.startedEpoch = 0;
         task.completedAtMs = 0;
         task.childClaimedNoReminder = false;
         task.parentOverrodeReminder = false;
@@ -245,7 +247,7 @@ public:
         uint32_t elapsed = (millis() - task.startedAtMs) / 1000;
         if (elapsed >= task.timeoutTimeSec) {
             task.state = TaskState::TIMED_OUT;
-            Serial.printf("[TASK] '%s' timed out after %ds\n", task.name, elapsed);
+            Serial.printf("[TASK] '%s' timed out after %lus\n", task.name, (unsigned long)elapsed);
             return true;
         }
         return false;
@@ -256,11 +258,11 @@ public:
     static void formatElapsed(uint32_t startMs, char* buf, size_t bufLen) {
         uint32_t elapsed = (millis() - startMs) / 1000;
         if (elapsed < 60) {
-            snprintf(buf, bufLen, "%ds", elapsed);
+            snprintf(buf, bufLen, "%lus", (unsigned long)elapsed);
         } else if (elapsed < 3600) {
-            snprintf(buf, bufLen, "%dm %ds", elapsed / 60, elapsed % 60);
+            snprintf(buf, bufLen, "%lum %lus", (unsigned long)(elapsed / 60), (unsigned long)(elapsed % 60));
         } else {
-            snprintf(buf, bufLen, "%dh %dm", elapsed / 3600, (elapsed % 3600) / 60);
+            snprintf(buf, bufLen, "%luh %lum", (unsigned long)(elapsed / 3600), (unsigned long)((elapsed % 3600) / 60));
         }
     }
 

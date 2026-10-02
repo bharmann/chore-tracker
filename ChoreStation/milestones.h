@@ -276,7 +276,7 @@ namespace MilestoneIcons {
             tft.setTextColor(0x7BCF);
             tft.setTextSize(1);
             tft.setCursor(15, 462);
-            tft.printf("Next: %s — %d pts to go", MILESTONES[earned].name, remaining);
+            tft.printf("Next: %s - %d pts to go", MILESTONES[earned].name, remaining);
         }
 
         return earned;

@@ -57,19 +57,10 @@ public:
     // ─── Family Members ──────────────────────────────────────────────────
 
     bool loadFamily(FamilyMember* members, uint8_t& count) {
-        File f = SD.open("/config/family.json", FILE_READ);
-        if (!f) {
-            Serial.println("[SD] No family.json found — first run?");
-            count = 0;
-            return false;
-        }
-
         JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, f);
-        f.close();
-
-        if (err) {
-            Serial.printf("[SD] family.json parse error: %s\n", err.c_str());
+        if (!_loadJson("/config/family.json", doc)) {
+            Serial.println("[SD] No readable family.json — first run?");
+            count = 0;
             return false;
         }
 
@@ -88,8 +79,7 @@ public:
             fm.remindedToday = false;
 
             // Parse RFID UID from hex string like "2B:B8:59:B1"
-            String uidStr = m["uid"].as<String>();
-            fm.rfidUidLength = _parseHexUid(uidStr, fm.rfidUid);
+            fm.rfidUidLength = parseHexUid(m["uid"] | "", fm.rfidUid);
 
             count++;
         }
@@ -122,18 +112,9 @@ public:
     // ─── Tasks ───────────────────────────────────────────────────────────
 
     bool loadTasks(Task* tasks, uint8_t& count, const char* path) {
-        File f = SD.open(path, FILE_READ);
-        if (!f) {
-            count = 0;
-            return false;
-        }
-
         JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, f);
-        f.close();
-
-        if (err) {
-            Serial.printf("[SD] Task parse error: %s\n", err.c_str());
+        if (!_loadJson(path, doc)) {
+            count = 0;
             return false;
         }
 
@@ -161,7 +142,10 @@ public:
             task.recurDays = t["recurDays"] | 0;
             task.recurHour = t["recurHour"] | 0;
             task.recurMinute = t["recurMin"] | 0;
-            task.startedAtMs = 0;
+            task.startedEpoch = t["startEpoch"] | 0;
+            // Until NTP lets restoreTaskTimers() rebuild it from startedEpoch,
+            // an in-progress task counts from boot rather than from 0.
+            task.startedAtMs = (task.state == TaskState::IN_PROGRESS) ? millis() : 0;
             task.completedAtMs = 0;
             count++;
         }
@@ -196,6 +180,7 @@ public:
             obj["recurDays"] = t.recurDays;
             obj["recurHour"] = t.recurHour;
             obj["recurMin"] = t.recurMinute;
+            obj["startEpoch"] = t.startedEpoch;
         }
 
         return _writeJson(path, doc);
@@ -204,17 +189,8 @@ public:
     // ─── Routines ────────────────────────────────────────────────────────
 
     bool loadRoutines(Routine* routines, uint8_t& count) {
-        File f = SD.open("/config/routines.json", FILE_READ);
-        if (!f) { count = 0; return false; }
-
         JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, f);
-        f.close();
-        if (err) {
-            Serial.printf("[SD] routines.json parse error: %s\n", err.c_str());
-            count = 0;
-            return false;
-        }
+        if (!_loadJson("/config/routines.json", doc)) { count = 0; return false; }
 
         JsonArray arr = doc["routines"].as<JsonArray>();
         count = 0;
@@ -317,14 +293,20 @@ public:
     }
 
     // ─── Raw JSON write (used by the web UI) ─────────────────────────────
-    // Validates that the body parses as JSON, then overwrites the file.
-    // Removes first so a shorter payload can't leave stale trailing bytes.
-    bool writeRawJson(const char* path, const String& body) {
+    // Validates that the body parses as JSON and has the expected top-level
+    // array (so a stray {} can't wipe the file), keeps the previous version as
+    // <path>.bak (loads fall back to it), then overwrites.
+    bool writeRawJson(const char* path, const String& body, const char* arrayKey) {
         JsonDocument doc;
         if (deserializeJson(doc, body)) {
             Serial.printf("[SD] writeRawJson: invalid JSON for %s\n", path);
             return false;
         }
+        if (!doc[arrayKey].is<JsonArray>()) {
+            Serial.printf("[SD] writeRawJson: %s needs a \"%s\" array\n", path, arrayKey);
+            return false;
+        }
+        copyFile(path, _bakPath(path).c_str());
         if (SD.exists(path)) SD.remove(path);
         File f = SD.open(path, FILE_WRITE);
         if (!f) {
@@ -341,7 +323,72 @@ public:
     // ─── First-Run Setup Detection ───────────────────────────────────────
 
     bool isFirstRun() {
-        return !SD.exists("/config/family.json");
+        return !SD.exists("/config/family.json") && !SD.exists("/config/family.json.bak");
+    }
+
+    // Parse "04:A2:3B:C1" (also tolerates spaces/dashes or no separators).
+    // Returns the byte count; 0 for an empty or malformed string.
+    static uint8_t parseHexUid(const char* hex, uint8_t* out) {
+        uint8_t len = 0;
+        int nibble = -1;
+        for (const char* p = hex; *p; p++) {
+            char c = *p;
+            int v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else if (c == ':' || c == ' ' || c == '-') {
+                if (nibble >= 0) {               // single-digit byte like "4:"
+                    if (len >= UID_LENGTH) return 0;
+                    out[len++] = (uint8_t)nibble; nibble = -1;
+                }
+                continue;
+            }
+            else return 0;
+            if (nibble < 0) nibble = v;
+            else {
+                if (len >= UID_LENGTH) return 0;
+                out[len++] = (uint8_t)((nibble << 4) | v);
+                nibble = -1;
+            }
+        }
+        if (nibble >= 0) {
+            if (len >= UID_LENGTH) return 0;
+            out[len++] = (uint8_t)nibble;
+        }
+        return len;
+    }
+
+    // ─── Touch calibration (5 values from TFT_eSPI::calibrateTouch) ──────
+
+    bool loadTouchCal(uint16_t* cal) {
+        JsonDocument doc;
+        if (!_loadJson("/config/touch.json", doc)) return false;
+        JsonArray a = doc["cal"].as<JsonArray>();
+        if (a.size() != 5) return false;
+        for (uint8_t i = 0; i < 5; i++) cal[i] = a[i] | 0;
+        return true;
+    }
+
+    bool saveTouchCal(const uint16_t* cal) {
+        JsonDocument doc;
+        JsonArray a = doc["cal"].to<JsonArray>();
+        for (uint8_t i = 0; i < 5; i++) a.add(cal[i]);
+        return _writeJson("/config/touch.json", doc);
+    }
+
+    bool copyFile(const char* src, const char* dst) {
+        File in = SD.open(src, FILE_READ);
+        if (!in) return false;
+        File out = SD.open(dst, FILE_WRITE);
+        if (!out) { in.close(); return false; }
+        uint8_t buf[512];
+        while (in.available()) {
+            size_t n = in.read(buf, sizeof(buf));
+            out.write(buf, n);
+        }
+        out.close(); in.close();
+        return true;
     }
 
 private:
@@ -349,6 +396,29 @@ private:
         if (!SD.exists(path)) {
             SD.mkdir(path);
         }
+    }
+
+    static String _bakPath(const char* path) { return String(path) + ".bak"; }
+
+    // Parse a JSON file, falling back to the <path>.bak shadow copy that
+    // BackupManager / writeRawJson keep, e.g. after a power cut mid-write.
+    bool _loadJson(const char* path, JsonDocument& doc) {
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            DeserializationError err = deserializeJson(doc, f);
+            f.close();
+            if (!err) return true;
+            Serial.printf("[SD] %s parse error: %s — trying .bak\n", path, err.c_str());
+        }
+        String bak = _bakPath(path);
+        f = SD.open(bak.c_str(), FILE_READ);
+        if (!f) return false;
+        doc.clear();
+        DeserializationError err = deserializeJson(doc, f);
+        f.close();
+        if (err) return false;
+        Serial.printf("[SD] Recovered %s from %s\n", path, bak.c_str());
+        return true;
     }
 
     bool _writeJson(const char* path, JsonDocument& doc) {
@@ -362,27 +432,9 @@ private:
         return true;
     }
 
-    uint8_t _parseHexUid(const String& hex, uint8_t* out) {
-        uint8_t len = 0;
-        int start = 0;
-        while (start < (int)hex.length() && len < UID_LENGTH) {
-            int colonPos = hex.indexOf(':', start);
-            String byteStr;
-            if (colonPos == -1) {
-                byteStr = hex.substring(start);
-                start = hex.length();
-            } else {
-                byteStr = hex.substring(start, colonPos);
-                start = colonPos + 1;
-            }
-            out[len++] = (uint8_t)strtoul(byteStr.c_str(), NULL, 16);
-        }
-        return len;
-    }
-
     void _uidToHex(const uint8_t* uid, uint8_t len, char* out) {
         out[0] = '\0';
-        for (uint8_t i = 0; i < len; i++) {
+        for (uint8_t i = 0; i < len && i < UID_LENGTH; i++) {
             char seg[4];
             if (i > 0) strcat(out, ":");
             snprintf(seg, sizeof(seg), "%02X", uid[i]);

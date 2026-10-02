@@ -57,12 +57,20 @@ extern uint8_t        activeTaskCount;
 #define CA_TXT3   0x7BCF
 #define CA_DIM    0x4A69
 
+// Defined in ChoreStation.ino: re-reads /tasks/recurring.json into the
+// scheduler so template edits apply today, not after the next reboot.
+void reloadRecurringTemplates();
+
 static const uint16_t CA_CAT_COLORS[] = {
     0x2C9F, 0x2E8B, 0xFDA0, 0x7A1F, 0xFBE0, 0x3666
 };
 
 class ParentAdmin {
 public:
+    // Set when the parent taps "Re-pair tags"; the main sketch owns that
+    // screen (it needs the RFID poll loop), so it checks and clears this.
+    bool wantsPairTags = false;
+
     enum class Menu : uint8_t { MAIN, CREATE_TASK, MANAGE_TASKS, FAMILY_SETTINGS, SYSTEM_INFO };
     enum class WizStep : uint8_t { TYPE, CATEGORY, NAME, SIZE, ASSIGN, SCHEDULE, OPTIONS, REVIEW };
 
@@ -72,6 +80,7 @@ public:
         _resetDraft();
         _editIdx = -1;
         _scroll = 0;
+        _confirmDel = -1;
     }
 
     void drawCurrentScreen() {
@@ -101,8 +110,12 @@ private:
     WizStep  _wizStep;
     Task     _draft;
     int8_t   _editIdx;        // -1 = new, >=0 = editing
-    uint8_t  _selName;        // Preset name index
+    uint8_t  _selName;        // Preset name index (NAMES_PER_CAT = keep _origName)
     uint8_t  _scroll;         // List scroll offset
+    int8_t   _confirmDel;     // Task index awaiting a second tap to delete
+    char     _origName[48];   // Name of the task being edited (may be custom)
+    bool     _hasOrigName;
+    int16_t  _sysBtnY;        // System Info button rows (set when drawn)
 
     // ── Multi-assign state ───────────────────────────────────────────────
     // Bitmask: bit N = family member N is selected.
@@ -140,6 +153,29 @@ private:
         _assignAny = false;
         _pickHour = 8;
         _pickMin = 0;
+        _origName[0] = '\0';
+        _hasOrigName = false;
+    }
+
+    // Name the draft will be saved with: a preset, or the edited task's own
+    // (possibly custom, web-entered) name.
+    const char* _draftName() {
+        if (_hasOrigName && _selName >= NAMES_PER_CAT) return _origName;
+        return presetTaskName(static_cast<uint8_t>(_draft.category), _selName);
+    }
+
+    // Task ids must be unique across active tasks AND recurring templates, or
+    // the scheduler can't tell an instance from its template and duplicates it.
+    uint16_t _newTaskId(const Task* recur, uint8_t recurCount) {
+        uint16_t id = 3000 + (millis() % 20000);
+        for (uint16_t tries = 0; tries < 60000; tries++, id++) {
+            if (id >= 60000) id = 3000;   // 60000+ is reserved for routine logs
+            bool used = false;
+            for (uint8_t i = 0; i < activeTaskCount && !used; i++) used = activeTasks[i].id == id;
+            for (uint8_t i = 0; i < recurCount && !used; i++) used = recur[i].id == id;
+            if (!used) return id;
+        }
+        return id;
     }
 
     void _hdr(const char* t, bool back = true) {
@@ -279,6 +315,12 @@ private:
             int16_t y = 55 + i * 42;
             bool sel = (i == _selName);
             _btn(15, y, 290, 36, presetTaskName(ci, i), sel ? CA_PRI : CA_CARD);
+        }
+        // Editing a task with a custom (e.g. web-entered) name: offer to keep it
+        if (_hasOrigName) {
+            int16_t y = 55 + NAMES_PER_CAT * 42;
+            bool sel = (_selName >= NAMES_PER_CAT);
+            _btn(15, y, 290, 36, _origName, sel ? CA_GOLD : CA_CARD, sel ? CA_BG : CA_TXT, 1);
         }
         _btn(210, 445, 100, 28, "NEXT >", CA_PRI, CA_TXT, 1);
     }
@@ -470,7 +512,7 @@ private:
 
         // Name
         tft.setTextColor(CA_TXT); tft.setTextSize(2);
-        tft.setCursor(15, y); tft.print(presetTaskName(ci, _selName)); y += 24;
+        tft.setCursor(15, y); tft.print(_draftName()); y += 24;
 
         // Info rows
         auto row = [&](const char* label, const char* val, uint16_t vc = CA_TXT2) {
@@ -571,12 +613,17 @@ private:
         case WizStep::NAME:
             for (uint8_t i=0;i<NAMES_PER_CAT;i++)
                 if (_hit(x,y,15,55+i*42,290,36)) { _selName=i; _drawWizard(); return false; }
+            if (_hasOrigName && _hit(x,y,15,55+NAMES_PER_CAT*42,290,36)) { _selName=NAMES_PER_CAT; _drawWizard(); return false; }
             if (next) { _wizStep=WizStep::SIZE; _drawWizard(); } break;
 
         case WizStep::SIZE:
             for (uint8_t i=0;i<3;i++)
                 if (_hit(x,y,15,58+i*72,290,64)) { _draft.size=static_cast<TaskSize>(i); _drawWizard(); return false; }
-            if (next) { _wizStep=WizStep::ASSIGN; _assignMask=0; _assignAll=false; _assignAny=false; _drawWizard(); } break;
+            if (next) {
+                _wizStep=WizStep::ASSIGN;
+                if (_editIdx < 0) { _assignMask=0; _assignAll=false; _assignAny=false; }  // edits keep their assignee
+                _drawWizard();
+            } break;
 
         case WizStep::ASSIGN:
         {
@@ -652,51 +699,72 @@ private:
     // ── Save: creates one task instance per selected assignee ─────────
 
     void _saveTask() {
-        uint8_t ci = static_cast<uint8_t>(_draft.category);
-        strlcpy(_draft.name, presetTaskName(ci, _selName), sizeof(_draft.name));
+        strlcpy(_draft.name, _draftName(), sizeof(_draft.name));
+
+        // ── Editing an existing task: update in place, do NOT create a
+        //    duplicate. Preserve the task's id and live state (an in-progress
+        //    or pending task stays in progress/pending with its timer). ──
+        if (_editIdx >= 0 && _editIdx < activeTaskCount) {
+            Task& t = activeTasks[_editIdx];
+            Task live = t;
+            memcpy(&t, &_draft, sizeof(Task));
+            t.id                     = live.id;
+            t.state                  = live.state;
+            t.startedAtMs            = live.startedAtMs;
+            t.completedAtMs          = live.completedAtMs;
+            t.startedEpoch           = live.startedEpoch;
+            t.noReminderToggled      = live.noReminderToggled;
+            t.childClaimedNoReminder = live.childClaimedNoReminder;
+            t.parentOverrodeReminder = live.parentOverrodeReminder;
+            t.noReminderApproved     = live.noReminderApproved;
+
+            // Resolve to a single assignee from the selection.
+            if (_assignAny) {
+                t.assignedTo = 255;
+            } else {
+                for (uint8_t i = 0; i < familyCount; i++) {
+                    if (_assignMask & (1 << i)) { t.assignedTo = i; break; }
+                }
+            }
+
+            // Recurring task: also update the persisted template (match by id)
+            // so the edit survives tomorrow's regeneration. A template shared
+            // by all children (254) stays shared.
+            if (t.type == TaskType::RECURRING) {
+                Task recurTasks[MAX_ACTIVE_TASKS];
+                uint8_t recurCount = 0;
+                storage.loadTasks(recurTasks, recurCount, "/tasks/recurring.json");
+                for (uint8_t i = 0; i < recurCount; i++) {
+                    if (recurTasks[i].id == t.id) {
+                        uint8_t keepAssign = recurTasks[i].assignedTo;
+                        memcpy(&recurTasks[i], &t, sizeof(Task));
+                        recurTasks[i].state = TaskState::AVAILABLE;
+                        recurTasks[i].startedEpoch = 0;
+                        recurTasks[i].noReminderToggled = false;
+                        recurTasks[i].childClaimedNoReminder = false;
+                        recurTasks[i].parentOverrodeReminder = false;
+                        recurTasks[i].noReminderApproved = false;
+                        if (keepAssign == 254) recurTasks[i].assignedTo = 254;
+                        break;
+                    }
+                }
+                storage.saveTasks(recurTasks, recurCount, "/tasks/recurring.json");
+                reloadRecurringTemplates();
+            }
+
+            backups.markTasksDirty();
+            audio.taskCompleteTone();
+            Serial.printf("[ADMIN] Edited task '%s'\n", t.name);
+            _editIdx = -1;
+            return;
+        }
+
         _draft.state = TaskState::AVAILABLE;
         _draft.noReminderToggled = false;
         _draft.childClaimedNoReminder = false;
         _draft.parentOverrodeReminder = false;
         _draft.noReminderApproved = false;
-
-        // ── Editing an existing task: update in place, do NOT create a
-        //    duplicate. Preserve the task's original id and live state. ──
-        if (_editIdx >= 0 && _editIdx < activeTaskCount) {
-            uint16_t keepId = activeTasks[_editIdx].id;
-            memcpy(&activeTasks[_editIdx], &_draft, sizeof(Task));
-            activeTasks[_editIdx].id = keepId;
-
-            // Resolve to a single assignee from the selection.
-            if (_assignAny) {
-                activeTasks[_editIdx].assignedTo = 255;
-            } else {
-                for (uint8_t i = 0; i < familyCount; i++) {
-                    if (_assignMask & (1 << i)) { activeTasks[_editIdx].assignedTo = i; break; }
-                }
-            }
-
-            // Recurring task: also update the persisted template (match by id)
-            // so the edit survives tomorrow's regeneration.
-            if (activeTasks[_editIdx].type == TaskType::RECURRING) {
-                Task recurTasks[MAX_ACTIVE_TASKS];
-                uint8_t recurCount = 0;
-                storage.loadTasks(recurTasks, recurCount, "/tasks/recurring.json");
-                for (uint8_t i = 0; i < recurCount; i++) {
-                    if (recurTasks[i].id == keepId) {
-                        memcpy(&recurTasks[i], &activeTasks[_editIdx], sizeof(Task));
-                        break;
-                    }
-                }
-                storage.saveTasks(recurTasks, recurCount, "/tasks/recurring.json");
-            }
-
-            backups.markTasksDirty();
-            audio.taskCompleteTone();
-            Serial.printf("[ADMIN] Edited task '%s'\n", activeTasks[_editIdx].name);
-            _editIdx = -1;
-            return;
-        }
+        _draft.startedEpoch = 0;
 
         // Build list of assignee IDs
         uint8_t assignees[MAX_FAMILY_MEMBERS];
@@ -722,7 +790,15 @@ private:
             assigneeCount = 1;
         }
 
-        // Create one task per assignee
+        bool recurring = (_draft.type == TaskType::RECURRING);
+        Task recurTasks[MAX_ACTIVE_TASKS];
+        uint8_t recurCount = 0;
+        if (recurring) storage.loadTasks(recurTasks, recurCount, "/tasks/recurring.json");
+
+        // Recurring "All children" = ONE template (254) the scheduler expands
+        // per child; its instances share the template id.
+        uint16_t sharedId = (recurring && _assignAll) ? _newTaskId(recurTasks, recurCount) : 0;
+
         uint8_t created = 0;
         for (uint8_t a = 0; a < assigneeCount; a++) {
             if (activeTaskCount >= MAX_ACTIVE_TASKS) {
@@ -730,32 +806,37 @@ private:
                 break;
             }
 
+            // Instance and its template MUST share an id, or the scheduler
+            // won't recognise the instance and generates a duplicate.
+            uint16_t id = sharedId ? sharedId : _newTaskId(recurTasks, recurCount);
+
             Task& newTask = activeTasks[activeTaskCount];
             memcpy(&newTask, &_draft, sizeof(Task));
             newTask.assignedTo = assignees[a];
-            newTask.id = (millis() & 0xFFF0) | (a & 0x0F);  // Unique per instance
+            newTask.id = id;
             newTask.startedAtMs = 0;
             newTask.completedAtMs = 0;
             activeTaskCount++;
             created++;
 
+            if (recurring && !sharedId && recurCount < MAX_ACTIVE_TASKS) {
+                memcpy(&recurTasks[recurCount], &newTask, sizeof(Task));
+                recurCount++;
+            }
+
             Serial.printf("[ADMIN] Created '%s' for %s\n", newTask.name,
                           assignees[a] < familyCount ? family[assignees[a]].name : "anyone");
         }
 
-        // If recurring, save to templates too
-        if (_draft.type == TaskType::RECURRING) {
-            Task recurTasks[MAX_ACTIVE_TASKS];
-            uint8_t recurCount = 0;
-            storage.loadTasks(recurTasks, recurCount, "/tasks/recurring.json");
-
-            for (uint8_t a = 0; a < assigneeCount && recurCount < MAX_ACTIVE_TASKS; a++) {
-                memcpy(&recurTasks[recurCount], &_draft, sizeof(Task));
-                recurTasks[recurCount].assignedTo = assignees[a];
-                recurTasks[recurCount].id = (millis() & 0xFFF0) | (a & 0x0F);
-                recurCount++;
-            }
+        if (recurring && sharedId && recurCount < MAX_ACTIVE_TASKS) {
+            memcpy(&recurTasks[recurCount], &_draft, sizeof(Task));
+            recurTasks[recurCount].id = sharedId;
+            recurTasks[recurCount].assignedTo = 254;
+            recurCount++;
+        }
+        if (recurring) {
             storage.saveTasks(recurTasks, recurCount, "/tasks/recurring.json");
+            reloadRecurringTemplates();
         }
 
         backups.markTasksDirty();
@@ -785,42 +866,104 @@ private:
             tft.setTextColor(CA_DIM); tft.setCursor(20, y + 20);
             if (t.assignedTo < familyCount) tft.print(family[t.assignedTo].name);
             else tft.print("Anyone");
-            // Delete X
-            tft.fillRoundRect(275, y + 4, 28, 28, 4, CA_ERR);
-            tft.setTextColor(CA_TXT); tft.setTextSize(1);
-            tft.setCursor(285, y + 12); tft.print("X");
+            // Delete X — first tap arms it, second tap deletes
+            if (_confirmDel == (int8_t)i) {
+                tft.fillRoundRect(215, y + 4, 88, 28, 4, CA_ERR);
+                tft.setTextColor(CA_TXT); tft.setTextSize(1);
+                tft.setCursor(222, y + 8);
+                tft.print(t.type == TaskType::RECURRING ? "Delete +" : "Delete?");
+                if (t.type == TaskType::RECURRING) { tft.setCursor(222, y + 19); tft.print("stop repeat"); }
+            } else {
+                tft.fillRoundRect(275, y + 4, 28, 28, 4, CA_ERR);
+                tft.setTextColor(CA_TXT); tft.setTextSize(1);
+                tft.setCursor(285, y + 12); tft.print("X");
+            }
             y += 40;
         }
-        if (_scroll > 0) { tft.setTextColor(CA_TXT3); tft.setTextSize(1); tft.setCursor(145, 50); tft.print("^ more"); }
+        if (_scroll > 0) { _btn(250, 10, 60, 28, "^ up", CA_BG, CA_TXT3, 1); }
         if (y >= 455) { tft.setTextColor(CA_TXT3); tft.setTextSize(1); tft.setCursor(140, 458); tft.print("v more"); }
     }
 
     bool _touchTaskList(uint16_t x, uint16_t y) {
         audio.touchClick();
-        if (x < 50 && y < 48) { _menu = Menu::MAIN; _drawMain(); return false; }
-        if (y >= 455 && _scroll + 10 < activeTaskCount) { _scroll += 5; _drawTaskList(); return false; }
-        if (y < 52 && y > 48 && _scroll > 0) { _scroll = (_scroll >= 5) ? _scroll - 5 : 0; _drawTaskList(); return false; }
+        if (x < 50 && y < 48) { _menu = Menu::MAIN; _confirmDel = -1; _drawMain(); return false; }
+        if (y >= 455 && _scroll + 10 < activeTaskCount) { _scroll += 5; _confirmDel = -1; _drawTaskList(); return false; }
+        if (x >= 250 && y < 48 && _scroll > 0) { _scroll = (_scroll >= 5) ? _scroll - 5 : 0; _confirmDel = -1; _drawTaskList(); return false; }
 
         int16_t ry = 52;
         for (uint8_t i = _scroll; i < activeTaskCount && (ry + 40) < 455; i++) {
             if (y >= ry && y < ry + 36) {
-                if (x >= 275) { // Delete
-                    for (uint8_t j = i; j < activeTaskCount - 1; j++)
-                        memcpy(&activeTasks[j], &activeTasks[j + 1], sizeof(Task));
-                    activeTaskCount--;
-                    backups.markTasksDirty();
+                bool armed = (_confirmDel == (int8_t)i);
+                if (armed && x >= 215) {          // second tap: delete
+                    _deleteTask(i);
+                    _confirmDel = -1;
                     _drawTaskList();
-                } else { // Edit
-                    _editIdx = i;
-                    memcpy(&_draft, &activeTasks[i], sizeof(Task));
-                    _selName = 0; _assignMask = (1 << _draft.assignedTo); _assignAll = false; _assignAny = (_draft.assignedTo == 255);
-                    _menu = Menu::CREATE_TASK; _wizStep = WizStep::CATEGORY; _drawWizard();
+                } else if (x >= 275) {            // first tap: arm
+                    _confirmDel = i;
+                    _drawTaskList();
+                } else {                          // Edit
+                    _confirmDel = -1;
+                    _beginEdit(i);
                 }
                 return false;
             }
             ry += 40;
         }
+        if (_confirmDel >= 0) { _confirmDel = -1; _drawTaskList(); }
         return false;
+    }
+
+    void _beginEdit(uint8_t i) {
+        _resetDraft();
+        _editIdx = i;
+        memcpy(&_draft, &activeTasks[i], sizeof(Task));
+        uint8_t a = _draft.assignedTo;
+        _assignMask = (a < familyCount) ? (1 << a) : 0;
+        _assignAll = false;
+        _assignAny = (a == 255);
+        if (!_assignAny && _assignMask == 0) _assignAny = true;   // unknown id
+        _pickHour = _draft.recurHour;
+        _pickMin  = _draft.recurMinute;
+
+        // Keep the existing name selectable even when it isn't a preset
+        strlcpy(_origName, _draft.name, sizeof(_origName));
+        _hasOrigName = true;
+        _selName = NAMES_PER_CAT;
+        uint8_t ci = static_cast<uint8_t>(_draft.category);
+        for (uint8_t n = 0; n < NAMES_PER_CAT; n++)
+            if (strcmp(presetTaskName(ci, n), _draft.name) == 0) { _selName = n; break; }
+
+        _menu = Menu::CREATE_TASK; _wizStep = WizStep::CATEGORY; _drawWizard();
+    }
+
+    // Deleting a recurring instance also removes its template; otherwise the
+    // scheduler regenerates it within five minutes and delete looks broken.
+    void _deleteTask(uint8_t i) {
+        Task gone = activeTasks[i];
+        for (uint8_t j = i; j + 1 < activeTaskCount; j++)
+            memcpy(&activeTasks[j], &activeTasks[j + 1], sizeof(Task));
+        activeTaskCount--;
+
+        if (gone.type == TaskType::RECURRING) {
+            // Other children's instances of a shared (254) template go too
+            for (uint8_t j = 0; j < activeTaskCount; ) {
+                if (activeTasks[j].id == gone.id && activeTasks[j].type == TaskType::RECURRING) {
+                    for (uint8_t k = j; k + 1 < activeTaskCount; k++)
+                        memcpy(&activeTasks[k], &activeTasks[k + 1], sizeof(Task));
+                    activeTaskCount--;
+                } else j++;
+            }
+            Task recurTasks[MAX_ACTIVE_TASKS];
+            uint8_t recurCount = 0;
+            storage.loadTasks(recurTasks, recurCount, "/tasks/recurring.json");
+            uint8_t keep = 0;
+            for (uint8_t j = 0; j < recurCount; j++)
+                if (recurTasks[j].id != gone.id) recurTasks[keep++] = recurTasks[j];
+            if (keep != recurCount) storage.saveTasks(recurTasks, keep, "/tasks/recurring.json");
+            reloadRecurringTemplates();
+        }
+        backups.markTasksDirty();
+        Serial.printf("[ADMIN] Deleted '%s'\n", gone.name);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -850,6 +993,8 @@ private:
             y += 48;
         }
 
+        _btn(15, 392, 290, 36, "Re-pair tags (scan new tags)", CA_PRI, CA_TXT, 1);
+
         _btn(15, 440, 120, 32, "< BACK", CA_DIM);
         _btn(185, 440, 120, 32, "SAVE", CA_OK);
     }
@@ -868,6 +1013,7 @@ private:
             }
         }
 
+        if (_hit(x, y, 15, 392, 290, 36)) { wantsPairTags = true; return false; }
         if (_hit(x, y, 15, 440, 120, 32)) { _menu = Menu::MAIN; _drawMain(); return false; }
         if (_hit(x, y, 185, 440, 120, 32)) {
             storage.saveFamily(family, familyCount);
@@ -925,6 +1071,7 @@ private:
         info("Members", fmBuf);
 
         y += 10;
+        _sysBtnY = y;   // touch handler uses the same rows
         _btn(15, y, 290, 36, "Create Backup Now", CA_PRI);
         y += 44;
         _btn(15, y, 290, 36, "Force Save All Data", CA_CARD);
@@ -934,17 +1081,14 @@ private:
         audio.touchClick();
         if (x < 50 && y < 48) { _menu = Menu::MAIN; _drawMain(); return false; }
 
-        // Estimate button positions based on info row count
-        // Backup Now button at ~y=290
-        if (_hit(x, y, 15, 275, 290, 36)) {
+        if (_hit(x, y, 15, _sysBtnY, 290, 36)) {
             char dateStr[11]; timeMan.currentDateStr(dateStr, sizeof(dateStr));
             backups.createDailyBackup(dateStr);
             audio.taskCompleteTone();
             _drawSysInfo(); // Refresh to show updated count
             return false;
         }
-        // Force Save at ~y=320
-        if (_hit(x, y, 15, 319, 290, 36)) {
+        if (_hit(x, y, 15, _sysBtnY + 44, 290, 36)) {
             backups.flushNow(
                 activeTasks, activeTaskCount, family, familyCount,
                 [](const Task* t, uint8_t c, const char* p) { storage.saveTasks(t, c, p); },

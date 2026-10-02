@@ -36,8 +36,10 @@ public:
     void begin() {
         _timeSynced = false;
         _lastSyncMs = 0;
+        _lastNtpTryMs = 0;
         _lastWifiAttemptMs = 0;
         _wifiConnected = false;
+        _connecting = false;
         _lastDay = 0;
         _lastUptimeRollMs = millis();
 
@@ -46,7 +48,11 @@ public:
 
         if (strlen(_ssid) > 0) {
             Serial.printf("[WIFI] Connecting to '%s'...\n", _ssid);
-            _connectWifi();
+            // At boot it's worth waiting so NTP time is known before the
+            // scheduler runs. After that, reconnects are non-blocking.
+            _startConnect();
+            while (_connecting) { _pollConnect(); delay(100); }
+            if (_wifiConnected) _syncNtp(5000);
         } else {
             Serial.println("[WIFI] No credentials found at /config/wifi.json");
             Serial.println("[TIME] Running without NTP — time will be approximate.");
@@ -54,21 +60,32 @@ public:
     }
 
     // Call from main loop — handles reconnection and periodic re-sync
+    // Never blocks for more than a few ms — this runs every main-loop pass,
+    // and a stall here freezes scanning and touch.
     void update() {
-        // If WiFi is connected but time not synced, sync now
-        if (_wifiConnected && !_timeSynced) {
-            _syncNtp();
+        if (_connecting) _pollConnect();
+
+        // The WiFi stack auto-reconnects on its own; notice when it has.
+        if (!_wifiConnected && !_connecting && WiFi.status() == WL_CONNECTED) {
+            _wifiConnected = true;
+            Serial.printf("[WIFI] Reconnected. IP: %s\n", WiFi.localIP().toString().c_str());
         }
 
-        // Periodic NTP re-sync
+        // If WiFi is connected but time not synced, check every few seconds
+        // (SNTP runs in the background; we just look whether it has landed).
+        if (_wifiConnected && !_timeSynced && millis() - _lastNtpTryMs > 3000) {
+            _syncNtp(0);
+        }
+
+        // Periodic NTP re-sync (the clock keeps running between syncs)
         if (_timeSynced && millis() - _lastSyncMs > NTP_SYNC_INTERVAL_MS) {
-            _syncNtp();
+            _syncNtp(0);
         }
 
         // Retry WiFi if disconnected
-        if (!_wifiConnected && strlen(_ssid) > 0) {
+        if (!_wifiConnected && !_connecting && strlen(_ssid) > 0) {
             if (millis() - _lastWifiAttemptMs > WIFI_RETRY_INTERVAL_MS) {
-                _connectWifi();
+                _startConnect();
             }
         }
 
@@ -83,6 +100,9 @@ public:
 
     bool isTimeSynced() const { return _timeSynced; }
     bool isWifiConnected() const { return _wifiConnected; }
+
+    // Optional parent PIN for the web editor ("webPin" in wifi.json)
+    const char* webPin() const { return _webPin; }
 
     // Current hour (0-23). Returns best estimate even without NTP.
     uint8_t currentHour() const {
@@ -173,14 +193,18 @@ public:
 
     void setTimezone(long gmtOffsetSec, int dstOffsetSec) {
         configTime(gmtOffsetSec, dstOffsetSec, NTP_SERVER_1, NTP_SERVER_2);
-        _syncNtp();
+        _syncNtp(0);
     }
 
 private:
     char _ssid[33];
     char _password[65];
+    char _webPin[33] = "";
     bool _timeSynced;
     bool _wifiConnected;
+    bool _connecting;
+    uint32_t _connectStartMs;
+    uint32_t _lastNtpTryMs;
     uint32_t _lastSyncMs;
     uint32_t _lastWifiAttemptMs;
     uint8_t  _lastDay;
@@ -204,6 +228,7 @@ private:
 
         strlcpy(_ssid, doc["ssid"] | "", sizeof(_ssid));
         strlcpy(_password, doc["password"] | "", sizeof(_password));
+        strlcpy(_webPin, doc["webPin"] | "", sizeof(_webPin));
 
         // Optional timezone override
         if (doc["gmtOffset"].is<long>()) {
@@ -217,40 +242,43 @@ private:
         return strlen(_ssid) > 0;
     }
 
-    void _connectWifi() {
+    void _startConnect() {
         _lastWifiAttemptMs = millis();
+        _connectStartMs = millis();
+        _connecting = true;
         WiFi.mode(WIFI_STA);
         WiFi.begin(_ssid, _password);
+    }
 
-        uint32_t start = millis();
-        while (WiFi.status() != WL_CONNECTED &&
-               millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-            delay(250);
-        }
-
+    void _pollConnect() {
         if (WiFi.status() == WL_CONNECTED) {
+            _connecting = false;
             _wifiConnected = true;
             Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        } else {
+        } else if (millis() - _connectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
+            _connecting = false;
             _wifiConnected = false;
             Serial.println("[WIFI] Connection failed. Will retry.");
             WiFi.disconnect(true);
         }
     }
 
-    void _syncNtp() {
+    // waitMs = 0 just checks whether SNTP has set the clock yet.
+    void _syncNtp(uint32_t waitMs) {
         if (!_wifiConnected) return;
+        _lastNtpTryMs = millis();
 
-        Serial.println("[NTP] Syncing time...");
         struct tm t;
-        if (getLocalTime(&t, 5000)) {
+        if (getLocalTime(&t, waitMs)) {
+            if (!_timeSynced) {
+                char buf[32];
+                strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+                Serial.printf("[NTP] Time synced: %s\n", buf);
+            }
             _timeSynced = true;
             _lastSyncMs = millis();
-            char buf[32];
-            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
-            Serial.printf("[NTP] Time synced: %s\n", buf);
-        } else {
-            Serial.println("[NTP] Sync failed — will retry.");
+        } else if (waitMs) {
+            Serial.println("[NTP] Not synced yet — will keep checking.");
         }
     }
 };

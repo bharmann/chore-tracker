@@ -108,32 +108,44 @@ public:
                 if (tmpl.recurDays != 127) continue;
             }
 
-            // Check if already in active list (by template ID)
-            if (_isAlreadyActive(tmpl.id)) continue;
+            // "All children" (254) templates expand to one instance per child,
+            // all sharing the template id; everything else is one instance.
+            for (uint8_t m = 0; m < familyCount || (tmpl.assignedTo != 254 && m == 0); m++) {
+                uint8_t who = tmpl.assignedTo;
+                if (tmpl.assignedTo == 254) {
+                    if (family[m].role != Role::CHILD) continue;
+                    who = m;
+                    if (_isAlreadyActive(tmpl.id, who)) continue;
+                } else if (_isAlreadyActive(tmpl.id)) {
+                    break;
+                }
 
-            // Check capacity
-            if (activeTaskCount >= MAX_ACTIVE_TASKS) {
-                Serial.println("[SCHED] Active task list full — skipping.");
-                break;
+                if (activeTaskCount >= MAX_ACTIVE_TASKS) {
+                    Serial.println("[SCHED] Active task list full — skipping.");
+                    break;
+                }
+
+                // Create instance from template
+                Task& newTask = activeTasks[activeTaskCount];
+                memcpy(&newTask, &tmpl, sizeof(Task));
+                newTask.assignedTo = who;
+                newTask.state = TaskState::AVAILABLE;
+                newTask.startedAtMs = 0;
+                newTask.completedAtMs = 0;
+                newTask.startedEpoch = 0;
+                newTask.noReminderToggled = false;
+                newTask.childClaimedNoReminder = false;
+                newTask.parentOverrodeReminder = false;
+                newTask.noReminderApproved = false;
+                activeTaskCount++;
+                added = true;
+
+                Serial.printf("[SCHED] Generated: '%s' (id=%d) for %s\n",
+                              newTask.name, newTask.id,
+                              newTask.assignedTo < familyCount
+                                  ? family[newTask.assignedTo].name : "anyone");
+                if (tmpl.assignedTo != 254) break;
             }
-
-            // Create instance from template
-            Task& newTask = activeTasks[activeTaskCount];
-            memcpy(&newTask, &tmpl, sizeof(Task));
-            newTask.state = TaskState::AVAILABLE;
-            newTask.startedAtMs = 0;
-            newTask.completedAtMs = 0;
-            newTask.noReminderToggled = false;
-            newTask.childClaimedNoReminder = false;
-            newTask.parentOverrodeReminder = false;
-            newTask.noReminderApproved = false;
-            activeTaskCount++;
-            added = true;
-
-            Serial.printf("[SCHED] Generated: '%s' (id=%d) for %s\n",
-                          newTask.name, newTask.id,
-                          newTask.assignedTo < familyCount
-                              ? family[newTask.assignedTo].name : "unassigned");
         }
 
         if (added) {
@@ -205,9 +217,12 @@ private:
     bool     _recurringLoaded;
     uint32_t _lastScheduleCheckMs;
 
-    bool _isAlreadyActive(uint16_t templateId) {
+    // An instance of this template already exists today. assignee 255 = any
+    // (a claimed "Anyone" task keeps the template id but changes assignee).
+    bool _isAlreadyActive(uint16_t templateId, uint8_t assignee = 255) {
         for (uint8_t i = 0; i < activeTaskCount; i++) {
-            if (activeTasks[i].id == templateId) return true;
+            if (activeTasks[i].id != templateId) continue;
+            if (assignee == 255 || activeTasks[i].assignedTo == assignee) return true;
         }
         return false;
     }
