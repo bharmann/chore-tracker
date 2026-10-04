@@ -24,12 +24,16 @@ jobs:
         run: cp User_Setup.h "$(arduino-cli config get directories.user)/libraries/TFT_eSPI/User_Setup.h"
 
       - name: Compile
-        run: arduino-cli compile --fqbn esp32:esp32:esp32 --warnings default ChoreStation
+        run: arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings default ChoreStation
 
-  web-ui:
+  host-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Keyboard layout test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I ChoreStation test/keyboard_layout_test.cpp -o kbt
+          ./kbt
       - uses: actions/setup-node@v4
         with:
           node-version: 22

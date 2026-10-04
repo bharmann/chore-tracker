@@ -33,6 +33,8 @@
 #include "backup_manager.h"
 #include "time_manager.h"
 #include "preset_names.h"
+#include "keyboard.h"
+#include "wifi_setup.h"
 
 extern TFT_eSPI       tft;
 extern AudioFeedback  audio;
@@ -316,12 +318,13 @@ private:
             bool sel = (i == _selName);
             _btn(15, y, 290, 36, presetTaskName(ci, i), sel ? CA_PRI : CA_CARD);
         }
-        // Editing a task with a custom (e.g. web-entered) name: offer to keep it
+        // A custom name (typed here, or the edited task's own web-entered name)
         if (_hasOrigName) {
             int16_t y = 55 + NAMES_PER_CAT * 42;
             bool sel = (_selName >= NAMES_PER_CAT);
             _btn(15, y, 290, 36, _origName, sel ? CA_GOLD : CA_CARD, sel ? CA_BG : CA_TXT, 1);
         }
+        _btn(15, 55 + (NAMES_PER_CAT + 1) * 42, 290, 36, "Type a custom name...", CA_DIM, CA_TXT, 1);
         _btn(210, 445, 100, 28, "NEXT >", CA_PRI, CA_TXT, 1);
     }
 
@@ -614,6 +617,17 @@ private:
             for (uint8_t i=0;i<NAMES_PER_CAT;i++)
                 if (_hit(x,y,15,55+i*42,290,36)) { _selName=i; _drawWizard(); return false; }
             if (_hasOrigName && _hit(x,y,15,55+NAMES_PER_CAT*42,290,36)) { _selName=NAMES_PER_CAT; _drawWizard(); return false; }
+            if (_hit(x,y,15,55+(NAMES_PER_CAT+1)*42,290,36)) {
+                char buf[sizeof(_origName)];
+                strlcpy(buf, _draftName(), sizeof(buf));
+                if (OnScreenKeyboard::run("Task name", buf, sizeof(buf), 40, true) && buf[0]) {
+                    strlcpy(_origName, buf, sizeof(_origName));
+                    _hasOrigName = true;
+                    _selName = NAMES_PER_CAT;
+                }
+                _drawWizard();
+                return false;
+            }
             if (next) { _wizStep=WizStep::SIZE; _drawWizard(); } break;
 
         case WizStep::SIZE:
@@ -975,7 +989,7 @@ private:
         _hdr("Family Settings");
 
         tft.setTextColor(CA_TXT3); tft.setTextSize(1);
-        tft.setCursor(15, 55); tft.print("DAILY GOALS (tasks per day)");
+        tft.setCursor(15, 55); tft.print("TAP A NAME TO RENAME     DAILY GOAL (tasks/day)");
 
         int16_t y = 72;
         for (uint8_t i = 0; i < familyCount; i++) {
@@ -1005,6 +1019,16 @@ private:
 
         for (uint8_t i = 0; i < familyCount; i++) {
             int16_t ry = 72 + i * 48;
+            if (_hit(x, y, 15, ry, 180, 42)) {                 // rename
+                char buf[NAME_LENGTH];
+                strlcpy(buf, family[i].name, sizeof(buf));
+                if (OnScreenKeyboard::run("Rename", buf, sizeof(buf), NAME_LENGTH - 1, true) && buf[0]) {
+                    strlcpy(family[i].name, buf, NAME_LENGTH);
+                    backups.markFamilyDirty();
+                }
+                _drawSettings();
+                return false;
+            }
             if (_hit(x, y, 205, ry + 7, 28, 28) && family[i].dailyGoal > 1) {
                 family[i].dailyGoal--; backups.markFamilyDirty(); _drawSettings(); return false;
             }
@@ -1075,6 +1099,8 @@ private:
         _btn(15, y, 290, 36, "Create Backup Now", CA_PRI);
         y += 44;
         _btn(15, y, 290, 36, "Force Save All Data", CA_CARD);
+        y += 44;
+        _btn(15, y, 290, 36, "WiFi Setup", CA_CARD);
     }
 
     bool _touchSysInfo(uint16_t x, uint16_t y) {
@@ -1086,6 +1112,11 @@ private:
             backups.createDailyBackup(dateStr);
             audio.taskCompleteTone();
             _drawSysInfo(); // Refresh to show updated count
+            return false;
+        }
+        if (_hit(x, y, 15, _sysBtnY + 88, 290, 36)) {
+            WifiSetup::run();
+            _drawSysInfo();
             return false;
         }
         if (_hit(x, y, 15, _sysBtnY + 44, 290, 36)) {

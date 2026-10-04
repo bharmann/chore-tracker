@@ -2,7 +2,7 @@
 
 **Hardware:** E32R40T (ESP32-32E + ST7796 4" TFT) + RFID-RC522  
 **Framework:** Arduino (Arduino IDE / arduino-cli; migrated off PlatformIO)  
-**Project Size:** ~7,400 lines across 18 source files
+**Project Size:** ~8,200 lines across 21 source files
 
 ## What It Does
 
@@ -101,13 +101,13 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
 3. Flash via Arduino IDE: open `ChoreStation/ChoreStation.ino` and click Upload (see `ARDUINO_IDE_SETUP.md`)
 4. Touch calibration (once): tap each corner arrow as it appears
 5. The setup wizard appears:
-   - Scan parent tag(s) → pick names
-   - Scan child tag(s) → pick names
+   - **WiFi setup** (optional): pick your network, type the password on the on-screen keyboard
+   - Scan parent tag(s) → pick or type names
+   - Scan child tag(s) → pick or type names
    - Review and save
    - Device reboots into normal mode
-6. Rename people to their real names from the web editor's **Family** tab (the wizard only offers preset names)
 
-**Lost or new tags, or touch way off?** Press and hold the BOOT button while "Starting..." shows to open **recovery mode**: re-pair tags (keeps names and points) or recalibrate touch. Admin → Family Settings → "Re-pair tags" does the same from a parent's dashboard. An unregistered tag shows "Unknown tag" plus its ID, and the web editor's Family tab can assign it with one tap.
+**Lost or new tags, new WiFi, or touch way off?** Press and hold the BOOT button while "Starting..." shows to open **recovery mode**: re-pair tags (keeps names and points), WiFi setup, or recalibrate touch. Admin → Family Settings → "Re-pair tags" does the same from a parent's dashboard. An unregistered tag shows "Unknown tag" plus its ID, and the web editor's Family tab can assign it with one tap.
 
 ## Daily Operation
 
@@ -118,7 +118,7 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
 4. Scan your tag to complete → bounces back to dashboard
 5. If you claimed the bonus, the task goes to parent review automatically
 6. Check your milestone badges by tapping the badge count in the header
-7. Noticed something that needs doing? Tap the gold "+" to propose a new task
+7. Noticed something that needs doing? Tap the gold "+" to propose a new task (pick one from the list, or "Type it myself...")
 8. **Routines** (bedtime, get-ready-for-school): tap the routine card on your dashboard, check off each step, then tap FINISH for a bundle of points — one scan, no per-step scanning. Routines light up gold during their time of day. Edit them in `/config/routines.json` on the SD card.
 
 ### For Parents
@@ -126,7 +126,7 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
 2. Pending tasks appear at the top of your task list with a red badge count
 3. Tap a pending task → APPROVE, OVERRIDE (remove bonus claim), or REJECT
 4. Tap the teal "+" for quick ad-hoc task creation (3 taps: category, name, assign)
-5. Tap the gear icon → full admin (create recurring tasks, manage tasks, adjust goals)
+5. Tap the gear icon → full admin (create recurring tasks with preset or typed names, manage tasks, rename people and adjust goals, WiFi setup)
 
 ### Web editor (from your phone)
 When the station is on WiFi, the home screen shows a URL like `http://192.168.1.50`. Open it in any browser on the same network to edit:
@@ -144,27 +144,30 @@ Any tag scan from any screen goes to that person's dashboard. No exceptions. Thi
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `ChoreStation.ino` | 1,839 | Boot, main loop, all screens, scan/touch routing, tag pairing, recovery |
-| `parent_admin.h` | 1,102 | Task creation wizard, task management, settings, system info |
+| `ChoreStation.ino` | 1,871 | Boot, main loop, all screens, scan/touch routing, tag pairing, recovery |
+| `parent_admin.h` | 1,133 | Task creation wizard, task management, settings, system info |
+| `setup_wizard.h` | 563 | First-run family registration flow |
 | `backup_manager.h` | 551 | Write coalescing, shadow copies, daily backups, log archiving |
-| `setup_wizard.h` | 521 | First-run family registration flow |
-| `storage_manager.h` | 444 | SD card JSON persistence (with .bak fallback), touch calibration |
+| `storage_manager.h` | 460 | SD card JSON persistence (with .bak fallback), touch calibration, WiFi credentials |
 | `web_server.h` | 420 | Phone web editor: chores, routines, family + tags |
 | `task_engine.h` | 380 | Task state machine, point calculator, completion logging |
 | `milestones.h` | 328 | 16 collectible badge definitions + collection screen |
 | `icons.h` | 314 | On-screen icons drawn via TFT primitives |
-| `time_manager.h` | 284 | WiFi + NTP time sync (non-blocking after boot) |
+| `time_manager.h` | 304 | WiFi + NTP time sync (non-blocking after boot) |
 | `scheduler.h` | 280 | Recurring task generation + daily reset + streak evaluation |
+| `wifi_setup.h` | 241 | On-device WiFi setup: scan, pick, type password |
+| `keyboard.h` | 232 | On-screen keyboard (slide-to-select, types on lift) |
 | `display_power.h` | 220 | PWM backlight dimming, sleep, anti-burn-in pixel shift |
 | `data_model.h` | 208 | All structs and enums |
 | `rfid_manager.h` | 175 | RC522 reader: debounce, health check + auto-recovery |
+| `keyboard_layout.h` | 143 | Keyboard geometry/content, unit-tested on a PC |
 | `routine_manager.h` | 139 | Routine checklists (bedtime / school mornings) |
 | `pins.h` | 89 | GPIO pin assignments (single source of truth) |
 | `audio_feedback.h` | 78 | DAC tone generation for scan/complete/error |
 | `preset_names.h` | 23 | Shared task name presets (6 per category) |
 | `User_Setup.h` | — | TFT_eSPI pin/driver config (copy into the library folder) |
 
-Host-side tests: `test/web_ui_contract.test.js` (jsdom) checks the web editor against the firmware's JSON loaders. CI (`.github/workflows/build.yml`) compiles the firmware and runs that test on every push.
+Host-side tests: `test/web_ui_contract.test.js` (jsdom) checks the web editor against the firmware's JSON loaders, and `test/keyboard_layout_test.cpp` checks the on-screen keyboard layout (every character typeable, keys on screen, no overlaps, exact hit-testing). CI (`.github/workflows/build.yml`) compiles the firmware and runs both on every push.
 
 ## Key Design Decisions
 
@@ -183,8 +186,6 @@ Host-side tests: `test/web_ui_contract.test.js` (jsdom) checks the web editor ag
 
 ## What's Not Built Yet
 
-- **On-device custom task names** — the touchscreen offers presets; custom names come from the web editor
 - **Voice input** — would need an I2S MEMS microphone module (INMP441)
 - **Notifications / remote dashboard** — the web editor covers LAN editing, but nothing pushes "task waiting for approval" to a phone yet
 - **Collaborative tasks** — joint tasks where both children work together on one item
-- **On-device WiFi picker** — credentials edited in wifi.json on SD card before first boot

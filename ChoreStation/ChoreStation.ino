@@ -32,6 +32,8 @@
 #include "scheduler.h"
 #include "parent_admin.h"
 #include "web_server.h"
+#include "keyboard.h"
+#include "wifi_setup.h"
 #include "preset_names.h"
 
 // TFT_eSPI reads its pin config from the User_Setup.h inside the LIBRARY folder,
@@ -98,6 +100,7 @@ bool     selfInitActive = false;
 uint8_t  selfInitStep   = 0;   // 0=category, 1=name, 2=size, 3=confirm
 Task     selfInitDraft;
 uint8_t  selfInitNameIdx = 0;
+char     selfInitCustom[41] = "";   // typed on the keyboard; overrides the preset
 
 // Quick-add state (parent fast path)
 bool     quickAddActive = false;
@@ -191,6 +194,12 @@ uint8_t totalPages();
 uint8_t countPending();
 
 // Preset names imported from preset_names.h as presetTaskName()
+
+// Name a child's proposed job will get: typed, or the chosen preset.
+const char* selfInitName() {
+    if (selfInitCustom[0]) return selfInitCustom;
+    return presetTaskName(static_cast<uint8_t>(selfInitDraft.category), selfInitNameIdx);
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SETUP
@@ -573,6 +582,7 @@ void touchDashboard(uint16_t x, uint16_t y) {
         selfInitDraft.requiresApproval = true;
         selfInitDraft.size = TaskSize::SMALL;
         selfInitNameIdx = 0;
+        selfInitCustom[0] = '\0';
         currentScreen = Screen::SELF_INIT;
         drawSelfInit();
         return;
@@ -828,6 +838,7 @@ void touchSelfInit(uint16_t x, uint16_t y) {
                 if (y >= 55 + i * 34 && y < 55 + i * 34 + 30) {
                     selfInitDraft.category = static_cast<TaskCategory>(i);
                     selfInitNameIdx = 0;
+                    selfInitCustom[0] = '\0';
                     drawSelfInit(); return;
                 }
             }
@@ -835,6 +846,7 @@ void touchSelfInit(uint16_t x, uint16_t y) {
             for (uint8_t i = 0; i < 6; i++) {
                 if (y >= 270 + i * 28 && y < 270 + i * 28 + 24) {
                     selfInitNameIdx = i;
+                    selfInitCustom[0] = '\0';
                     drawSelfInit(); return;
                 }
             }
@@ -853,12 +865,18 @@ void touchSelfInit(uint16_t x, uint16_t y) {
             break;
 
         case 2: // Confirm
+            if (y >= 250 && y <= 290) { // type their own name for the job
+                char buf[sizeof(selfInitCustom)];
+                strlcpy(buf, selfInitName(), sizeof(buf));
+                if (OnScreenKeyboard::run("What's the job?", buf, sizeof(buf), sizeof(buf) - 1, true) && buf[0])
+                    strlcpy(selfInitCustom, buf, sizeof(selfInitCustom));
+                drawSelfInit();
+                return;
+            }
             if (x >= 180 && y >= 440) { // SAVE
                 // Create the self-init task
                 if (activeTaskCount < MAX_ACTIVE_TASKS) {
-                    uint8_t ci = static_cast<uint8_t>(selfInitDraft.category);
-                    strlcpy(selfInitDraft.name, presetTaskName(ci, selfInitNameIdx),
-                            sizeof(selfInitDraft.name));
+                    strlcpy(selfInitDraft.name, selfInitName(), sizeof(selfInitDraft.name));
                     selfInitDraft.id = millis() & 0xFFFF;
                     selfInitDraft.state = TaskState::AVAILABLE;
                     selfInitDraft.requiresApproval = true;
@@ -947,8 +965,8 @@ void drawSelfInit() {
 
             tft.fillRoundRect(15, 100, 290, 70, 8, C_CARD);
             Icons::drawCategoryIcon(22, 108, selfInitDraft.category, catC(selfInitDraft.category), 24);
-            tft.setTextColor(C_TXT); tft.setTextSize(2);
-            tft.setCursor(54, 105); tft.print(presetTaskName(ci, selfInitNameIdx));
+            tft.setTextColor(C_TXT); tft.setTextSize(selfInitCustom[0] && strlen(selfInitCustom) > 20 ? 1 : 2);
+            tft.setCursor(54, 105); tft.print(selfInitName());
             tft.setTextColor(C_TXT3); tft.setTextSize(1);
             tft.setCursor(54, 130); tft.printf("%s  |  %s  |  +%d pts",
                 CAT_NAMES[ci], SIZE_NAMES[(int)selfInitDraft.size],
@@ -961,6 +979,10 @@ void drawSelfInit() {
             tft.print("A parent will review and approve");
             tft.setCursor(15, 215);
             tft.print("both the task and your work.");
+
+            tft.fillRoundRect(15, 250, 290, 40, 6, C_CARD);
+            tft.setTextColor(C_TXT2); tft.setTextSize(2);
+            tft.setCursor(30, 262); tft.print("Type it myself...");
 
             tft.fillRoundRect(15, 440, 120, 30, 5, C_DIM);
             tft.setTextColor(C_TXT); tft.setTextSize(1);
@@ -1761,36 +1783,46 @@ void drawRecovery() {
     tft.setTextColor(C_TXT3); tft.setTextSize(1);
     tft.setCursor(20, 45); tft.print("Let go of BOOT, then pick an option.");
 
-    tft.fillRoundRect(15, 80, 290, 110, 10, C_PRI);
+    tft.fillRoundRect(15, 70, 290, 80, 10, C_PRI);
     tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(35, 115); tft.print("Re-pair family tags");
+    tft.setCursor(35, 92); tft.print("Re-pair family tags");
     tft.setTextSize(1);
-    tft.setCursor(35, 145); tft.print("Keeps names, points and streaks");
+    tft.setCursor(35, 120); tft.print("Keeps names, points and streaks");
 
-    tft.fillRoundRect(15, 210, 290, 110, 10, C_CARD);
+    tft.fillRoundRect(15, 160, 290, 80, 10, C_CARD);
     tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(35, 245); tft.print("Calibrate touch");
-    tft.setTextSize(1);
-    tft.setTextColor(C_TXT2);
-    tft.setCursor(35, 275); tft.print("Or press the BOOT button again");
+    tft.setCursor(35, 182); tft.print("WiFi setup");
+    tft.setTextSize(1); tft.setTextColor(C_TXT2);
+    tft.setCursor(35, 210); tft.print("Pick a network, type the password");
 
-    tft.fillRoundRect(15, 400, 290, 50, 10, C_DIM);
+    tft.fillRoundRect(15, 250, 290, 80, 10, C_CARD);
     tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(130, 417); tft.print("EXIT");
+    tft.setCursor(35, 272); tft.print("Calibrate touch");
+    tft.setTextSize(1); tft.setTextColor(C_TXT2);
+    tft.setCursor(35, 300); tft.print("Or press the BOOT button again");
+
+    tft.fillRoundRect(15, 410, 290, 50, 10, C_DIM);
+    tft.setTextColor(C_TXT); tft.setTextSize(2);
+    tft.setCursor(130, 427); tft.print("EXIT");
 
     tft.setTextColor(C_TXT3); tft.setTextSize(1);
     tft.setCursor(20, 345);
     tft.printf("Reader: %s (0x%02X)", rfid.isOnline() ? "online" : "OFFLINE", rfid.version());
+    tft.setCursor(20, 360);
     if (WiFi.status() == WL_CONNECTED) {
-        tft.setCursor(20, 360);
+        tft.printf("WiFi: %s", WiFi.SSID().c_str());
+        tft.setCursor(20, 375);
         tft.printf("Web editor: http://%s", WiFi.localIP().toString().c_str());
+    } else {
+        tft.print("WiFi: not connected");
     }
 }
 
 void touchRecovery(uint16_t x, uint16_t y) {
-    if (y >= 80 && y <= 190)  { goPairTags(); return; }
-    if (y >= 210 && y <= 320) { runTouchCalibration(); drawRecovery(); return; }
-    if (y >= 400 && y <= 450) { goHome(); return; }
+    if (y >= 70 && y <= 150)  { goPairTags(); return; }
+    if (y >= 160 && y <= 240) { WifiSetup::run(); drawRecovery(); return; }
+    if (y >= 250 && y <= 330) { runTouchCalibration(); drawRecovery(); return; }
+    if (y >= 410 && y <= 460) { goHome(); return; }
 }
 
 // TFT_eSPI's corner-arrow routine reads raw touch values, so it works no matter

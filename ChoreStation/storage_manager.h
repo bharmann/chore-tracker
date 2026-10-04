@@ -359,6 +359,22 @@ public:
         return len;
     }
 
+    // ─── WiFi credentials (on-device WiFi setup) ─────────────────────────
+    // Updates ssid/password in /config/wifi.json, keeping every other key
+    // (timezone, webPin). Previous version kept as wifi.json.bak.
+    bool saveWifiCredentials(const char* ssid, const char* password) {
+        JsonDocument doc;
+        if (!_loadJson("/config/wifi.json", doc) || !doc.is<JsonObject>()) {
+            doc.clear();
+            doc["gmtOffset"] = -28800;   // README default (Pacific)
+            doc["dstOffset"] = 3600;
+        }
+        doc["ssid"] = ssid;
+        doc["password"] = password;
+        copyFile("/config/wifi.json", "/config/wifi.json.bak");
+        return _writeJson("/config/wifi.json", doc);
+    }
+
     // ─── Touch calibration (5 values from TFT_eSPI::calibrateTouch) ──────
 
     bool loadTouchCal(uint16_t* cal) {

@@ -54,6 +54,9 @@ public:
             while (_connecting) { _pollConnect(); delay(100); }
             if (_wifiConnected) _syncNtp(5000);
         } else {
+            // Bring the network stack up anyway so the web server can listen
+            // and on-device WiFi setup can scan without a reboot.
+            WiFi.mode(WIFI_STA);
             Serial.println("[WIFI] No credentials found at /config/wifi.json");
             Serial.println("[TIME] Running without NTP — time will be approximate.");
         }
@@ -103,6 +106,21 @@ public:
 
     // Optional parent PIN for the web editor ("webPin" in wifi.json)
     const char* webPin() const { return _webPin; }
+
+    const char* ssid() const { return _ssid; }
+    const char* password() const { return _password; }
+    bool isConnecting() const { return _connecting; }
+
+    // Switch networks now (on-device WiFi setup). Doesn't touch the SD card:
+    // the caller saves the credentials once the connection actually works.
+    void useNetwork(const char* ssid, const char* password) {
+        strlcpy(_ssid, ssid, sizeof(_ssid));
+        strlcpy(_password, password, sizeof(_password));
+        WiFi.disconnect();
+        _wifiConnected = false;
+        if (_ssid[0]) _startConnect();
+        else _connecting = false;
+    }
 
     // Current hour (0-23). Returns best estimate even without NTP.
     uint8_t currentHour() const {
@@ -214,6 +232,10 @@ private:
         _ssid[0] = '\0';
         _password[0] = '\0';
 
+        // Default timezone + NTP servers, so time still syncs if WiFi is set
+        // up later on the device (wifi.json missing or unreadable now).
+        configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+
         File f = SD.open("/config/wifi.json", FILE_READ);
         if (!f) return false;
 
@@ -235,8 +257,6 @@ private:
             long gmt = doc["gmtOffset"];
             int dst = doc["dstOffset"] | 3600;
             configTime(gmt, dst, NTP_SERVER_1, NTP_SERVER_2);
-        } else {
-            configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
         }
 
         return strlen(_ssid) > 0;

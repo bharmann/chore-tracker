@@ -66,8 +66,10 @@ Go to **Tools** and set:
 | Flash Frequency | 80MHz |
 | Flash Mode | DIO |
 | Flash Size | 4MB (32Mb) |
-| Partition Scheme | Default 4MB with spiffs |
+| Partition Scheme | **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)** |
 | Port | (your USB serial port) |
+
+The partition scheme matters: the firmware no longer fits the default 1.2 MB program slot. All data lives on the SD card, so the internal SPIFFS area this scheme shrinks was never used. A bigger SD card does not help here; this is the ESP32's own flash.
 
 ## 7. Prepare SD Card
 
@@ -87,7 +89,9 @@ SD Card Root/
 └── archive/           ← Created automatically
 ```
 
-**Edit `config/wifi.json` before inserting the card:**
+**WiFi:** either edit `config/wifi.json` before inserting the card (below), or leave it and set WiFi up on the station itself: the welcome screen has a **WiFi setup** button (scan, tap your network, type the password on the on-screen keyboard), and so do recovery mode and Admin → System Info. The station only reaches 2.4 GHz networks.
+
+**To set WiFi on the card instead, edit `config/wifi.json` before inserting it:**
 ```json
 {
   "ssid": "YourNetworkName",
@@ -136,14 +140,17 @@ Things that commonly go wrong:
 ## 10. First Boot
 
 1. **Touch calibration** runs once: touch each corner arrow as it appears (a stylus works best). The result is saved to `config/touch.json`.
-2. The **setup wizard** appears: scan each family member's tag and pick a name. Names, goals and tags can be changed later from the phone web editor (Family tab).
+2. The **setup wizard** appears. Tap **WiFi setup** first if `wifi.json` isn't filled in, then scan each family member's tag and pick a name or tap **Type a name...** for the on-screen keyboard. Names, goals and tags can be changed later on the device (Admin → Family Settings → tap a name) or from the phone web editor (Family tab).
 3. The station restarts into normal mode. The home screen shows the web editor's address once WiFi connects.
 
 ## Recovery mode
 
 Power the station on, then **press and hold BOOT while "Starting..." is on screen** (don't hold it while plugging in: that puts the ESP32 into its flashing mode instead). The recovery screen offers:
 - **Re-pair family tags**: scan a new tag for each person, keeping names, points and streaks.
+- **WiFi setup**: pick a network and type its password on the on-screen keyboard.
 - **Calibrate touch**: press BOOT again for this if the touch screen is too far off to hit the button.
+
+**On-screen keyboard tip:** touch a key and slide until the big preview shows the letter you want, then lift; the key types on release. Double-tap *shift* for caps lock; *#+=* has the symbols.
 
 ## Troubleshooting
 
@@ -168,4 +175,4 @@ The firmware re-checks every 5 seconds, so it comes online by itself once wiring
 
 **RFID: "Unknown tag" with an ID underneath.** The reader works but the tag isn't registered. Either open the web editor → Family → "Use last scan" on the right person → Save, or use recovery mode → Re-pair family tags.
 
-**WiFi won't connect:** Verify SSID and password in wifi.json are exact (case-sensitive). The station still works without WiFi — you just lose accurate time sync. It retries in the background without freezing the screen.
+**WiFi won't connect:** Use WiFi setup (above) to re-pick the network and retype the password, or check SSID and password in wifi.json (case-sensitive). The ESP32 can't see 5 GHz-only networks. The station still works without WiFi — you just lose accurate time sync. It retries in the background without freezing the screen.

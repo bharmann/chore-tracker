@@ -25,6 +25,8 @@
 #include "rfid_manager.h"
 #include "audio_feedback.h"
 #include "storage_manager.h"
+#include "keyboard.h"
+#include "wifi_setup.h"
 
 extern TFT_eSPI      tft;
 extern RFIDManager   rfid;
@@ -92,8 +94,12 @@ private:
     Role          _currentScanRole;
     uint8_t       _parentsDone;
     uint8_t       _childrenDone;
-    uint8_t       _selectedNameIdx;
+    uint8_t       _selectedNameIdx;     // CUSTOM_NAME = typed on the keyboard
+    char          _customName[NAME_LENGTH] = "";
     bool          _readerOnline = false;
+
+    static const uint8_t CUSTOM_NAME = 255;
+    static const int16_t TYPE_BTN_Y = 385;   // "Type a name" button
 
     // Temporary storage for the tag just scanned
     uint8_t       _pendingUid[UID_LENGTH];
@@ -184,6 +190,13 @@ private:
 
         // "Begin" button
         _drawButton(85, 400, 150, 45, "BEGIN", 0x2C9F);
+
+        // WiFi first, so the station has the time and the web editor from day one
+        tft.fillRoundRect(85, 452, 150, 24, 6, 0x2945);
+        tft.setTextColor(WiFi.status() == WL_CONNECTED ? 0x2E8B : 0xB596);
+        tft.setTextSize(1);
+        tft.setCursor(WiFi.status() == WL_CONNECTED ? 91 : 130, 460);
+        tft.print(WiFi.status() == WL_CONNECTED ? "WiFi connected - change" : "WiFi setup");
     }
 
     void _drawScanPrompt(const char* roleLabel) {
@@ -248,7 +261,7 @@ private:
             int16_t bx = padX + col * (btnW + padX);
             int16_t by = startY + row * (btnH + padY);
 
-            if (by + btnH > 400) break;  // Don't overflow
+            if (by + btnH > TYPE_BTN_Y) break;  // Don't overflow
 
             bool selected = (i == _selectedNameIdx);
             uint16_t bgColor = selected ? 0x2C9F : 0x2945;
@@ -262,6 +275,14 @@ private:
             tft.setCursor(bx + (btnW - textW) / 2, by + 10);
             tft.print(names[i]);
         }
+
+        // Type a real name on the on-screen keyboard
+        bool custom = (_selectedNameIdx == CUSTOM_NAME);
+        tft.fillRoundRect(10, TYPE_BTN_Y, 300, 36, 6, custom ? 0x2C9F : 0x2945);
+        tft.setTextColor(custom ? 0xFFFF : 0xB596); tft.setTextSize(2);
+        tft.setCursor(22, TYPE_BTN_Y + 10);
+        if (custom) tft.printf("Name: %s", _customName);
+        else        tft.print("Type a name...");
 
         // Confirm button
         _drawButton(85, 430, 150, 40, "CONFIRM", 0x2E8B);
@@ -335,6 +356,7 @@ private:
             memcpy(_pendingUid, uid, uidLen);
             _pendingUidLen = uidLen;
             _selectedNameIdx = 0;
+            _customName[0] = '\0';
 
             audio.scanBeep();
 
@@ -351,6 +373,12 @@ private:
     void handleTouch(uint16_t tx, uint16_t ty) {
         switch (_step) {
             case Step::WELCOME:
+                // WiFi button: y=452..476
+                if (ty >= 450 && tx >= 85 && tx <= 235) {
+                    WifiSetup::run();
+                    drawCurrentStep();
+                    break;
+                }
                 // BEGIN button: y=400..445, x=85..235
                 if (ty >= 400 && ty <= 445 && tx >= 85 && tx <= 235) {
                     audio.touchClick();
@@ -391,6 +419,19 @@ private:
                         drawCurrentStep();
                         return;
                     }
+                }
+
+                // Type a name
+                if (ty >= TYPE_BTN_Y && ty <= TYPE_BTN_Y + 36) {
+                    audio.touchClick();
+                    char buf[NAME_LENGTH];
+                    strlcpy(buf, _customName, sizeof(buf));
+                    if (OnScreenKeyboard::run("Name", buf, sizeof(buf), NAME_LENGTH - 1, true) && buf[0]) {
+                        strlcpy(_customName, buf, sizeof(_customName));
+                        _selectedNameIdx = CUSTOM_NAME;
+                    }
+                    drawCurrentStep();
+                    return;
                 }
 
                 // CONFIRM button: y=430..470, x=85..235
@@ -435,7 +476,8 @@ private:
 
         const char** names = (_currentScanRole == Role::PARENT)
                              ? _parentNames : _childNames;
-        strlcpy(m.name, names[_selectedNameIdx], NAME_LENGTH);
+        strlcpy(m.name, _selectedNameIdx == CUSTOM_NAME ? _customName : names[_selectedNameIdx],
+                NAME_LENGTH);
 
         _memberCount++;
         Serial.printf("[SETUP] Registered: %s (%s) UID length=%d\n",
