@@ -13,6 +13,14 @@
 // =============================================================================
 
 #include <Arduino.h>
+
+// The E32R40T is a classic ESP32 (ESP32-WROOM-32E). Building for another chip
+// (e.g. an ESP32-S3 left selected from another project) fails later with
+// confusing errors like "'dacWrite' was not declared", so say it plainly.
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+#error "Wrong board selected: use Tools > Board > esp32 > ESP32 Dev Module (the E32R40T is a classic ESP32). Then re-check Partition Scheme = Minimal SPIFFS (1.9MB APP with OTA) and Upload Speed = 460800."
+#endif
+
 #include <SPI.h>
 #include <TFT_eSPI.h>
 
