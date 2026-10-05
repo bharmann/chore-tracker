@@ -145,10 +145,12 @@ Things that commonly go wrong:
 
 ## Recovery mode
 
-Power the station on, then **press and hold BOOT while "Starting..." is on screen** (don't hold it while plugging in: that puts the ESP32 into its flashing mode instead). The recovery screen offers:
+Power the station on, then **press and hold BOOT while "Starting..." is on screen** (don't hold it while plugging in: that puts the ESP32 into its flashing mode instead). Every recovery option works **without the touch screen**: press BOOT to move to the next option, hold BOOT for one second to choose it (tapping works too, when touch is OK). The options:
 - **Re-pair family tags**: scan a new tag for each person, keeping names, points and streaks.
-- **WiFi setup**: pick a network and type its password on the on-screen keyboard.
-- **Calibrate touch**: press BOOT again for this if the touch screen is too far off to hit the button.
+- **WiFi setup**: pick a network and type its password on the on-screen keyboard (needs working touch: calibrate first if taps are off).
+- **Calibrate touch**: touch the four corner arrows, then tap two test boxes. The calibration is only saved if the test taps land in the boxes; otherwise it starts over. (BOOT during the test: press = redo, hold = keep anyway.)
+- **Start setup over**: after a confirmation, erases the family (names, tags, points, streaks; the old file is kept as `config/family.json.old`) and restarts into the setup wizard. Chores and routines are kept, but they're assigned by position, so register people in the same order as before.
+- **Exit**.
 
 **On-screen keyboard tip:** touch a key and slide until the big preview shows the letter you want, then lift; the key types on release. Double-tap *shift* for caps lock; *#+=* has the symbols.
 
@@ -158,7 +160,7 @@ Power the station on, then **press and hold BOOT while "Starting..." is on scree
 
 **Compile error "TFT_eSPI would share the RC522/SD bus":** The `User_Setup.h` inside the TFT_eSPI library folder is an old copy. Repeat step 4.
 
-**Touches land on the wrong button:** Recalibrate from recovery mode (above), or delete `config/touch.json` from the SD card to recalibrate on the next boot.
+**Touches land on the wrong button, or taps do nothing:** Recalibrate from recovery mode (above; it works with just the BOOT button), or delete `config/touch.json` from the SD card to recalibrate on the next boot. A badly-off calibration makes taps "do nothing": the display library discards touches that map outside the screen. Serial Monitor prints `[TOUCH] x,y` for every tap, so you can see where taps actually land.
 
 **SD card not detected:** The station shows "No SD card" and restarts by itself once a FAT32 card is readable. The SD card shares the VSPI bus with the RC522 — both CS pins must be correctly wired.
 

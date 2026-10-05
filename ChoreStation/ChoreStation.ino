@@ -42,6 +42,7 @@
 #include "web_server.h"
 #include "keyboard.h"
 #include "wifi_setup.h"
+#include "button_menu.h"
 #include "preset_names.h"
 
 // TFT_eSPI reads its pin config from the User_Setup.h inside the LIBRARY folder,
@@ -123,7 +124,7 @@ uint32_t detailShownAtMs = 0;
 enum class Screen : uint8_t {
     HOME, DASHBOARD, TASK_DETAIL, SELF_INIT, QUICK_ADD,
     PARENT_ADMIN, MILESTONES, ROUTINE, SETUP,
-    NO_SD, PAIR_TAGS, RECOVERY
+    NO_SD, PAIR_TAGS
 };
 Screen currentScreen = Screen::HOME;
 
@@ -190,9 +191,11 @@ void drawPairTags();
 void handlePairScan(uint8_t* uid, uint8_t len);
 void touchPairTags(uint16_t x, uint16_t y);
 void finishPairing();
-void goRecovery();
-void drawRecovery();
-void touchRecovery(uint16_t x, uint16_t y);
+void runRecovery();
+bool confirmStartOver();
+void startSetupOver();
+bool touchCalPlausible(const uint16_t* cal);
+uint8_t waitTapInBox(int16_t bx, int16_t by, int16_t bw, int16_t bh);
 void runTouchCalibration();
 void restoreTaskTimers();
 bool canStartTask(const Task& t, uint8_t memberId);
@@ -243,8 +246,12 @@ void setup() {
     // Touch calibration is per-unit; run it once (or on request) and keep the
     // result on the SD card. Every tap target depends on it.
     uint16_t cal[5];
-    if (storage.loadTouchCal(cal)) tft.setTouch(cal);
-    else runTouchCalibration();
+    if (storage.loadTouchCal(cal) && touchCalPlausible(cal)) {
+        tft.setTouch(cal);
+        Serial.printf("[TOUCH] Calibration loaded: %u %u %u %u %u\n", cal[0], cal[1], cal[2], cal[3], cal[4]);
+    } else {
+        runTouchCalibration();   // missing or implausible touch.json
+    }
 
     tft.fillScreen(C_BG);
     tft.setTextColor(C_PRI); tft.setTextSize(2);
@@ -271,7 +278,7 @@ void setup() {
         scheduler.begin();
         if (activeTaskCount == 0) scheduler.generateRecurringTasks();
         web.begin(timeMan.webPin());   // parent web editor (reachable once WiFi is up)
-        if (bootHeld) goRecovery();
+        if (bootHeld) runRecovery();
         else          goHome();
     }
     audio.scanBeep(); lastActivityMs = millis();
@@ -319,22 +326,6 @@ void loop() {
     if (rfid.isOnline() != lastRfidOnline) {
         lastRfidOnline = rfid.isOnline();
         if (currentScreen == Screen::HOME || currentScreen == Screen::PAIR_TAGS) redrawCurrent();
-    }
-
-    // Recovery screen: the BOOT button picks touch calibration, in case the
-    // touch screen is too far off to hit the on-screen button.
-    // Only a fresh press counts: the press that opened recovery may still be held.
-    static bool bootArmed = false;
-    if (currentScreen == Screen::RECOVERY) {
-        bool down = (digitalRead(PIN_BOOT_BUTTON) == LOW);
-        if (!down) bootArmed = true;
-        else if (bootArmed) {
-            bootArmed = false;
-            runTouchCalibration();
-            drawRecovery();
-        }
-    } else {
-        bootArmed = false;
     }
 
     if (timersNeedRestore && timeMan.isTimeSynced()) restoreTaskTimers();
@@ -534,6 +525,7 @@ void handleScan(uint8_t* uid, uint8_t len) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void handleTouch(uint16_t x, uint16_t y) {
+    Serial.printf("[TOUCH] %u,%u\n", x, y);   // where taps land: calibration diagnostics
     audio.touchClick();
 
     // Dismiss message overlay on any touch
@@ -547,7 +539,6 @@ void handleTouch(uint16_t x, uint16_t y) {
         case Screen::SELF_INIT:   touchSelfInit(x, y); break;
         case Screen::QUICK_ADD:   touchQuickAdd(x, y); break;
         case Screen::PAIR_TAGS:   touchPairTags(x, y); break;
-        case Screen::RECOVERY:    touchRecovery(x, y); break;
         case Screen::PARENT_ADMIN:
             if (admin.handleTouch(x, y)) goDashboard(currentUserId);
             else if (admin.wantsPairTags) { admin.wantsPairTags = false; goPairTags(); }
@@ -1186,7 +1177,6 @@ void redrawCurrent() {
             else goHome();
             break;
         case Screen::PAIR_TAGS:    drawPairTags(); break;
-        case Screen::RECOVERY:     drawRecovery(); break;
         case Screen::NO_SD:        drawNoSd(); break;
         default: break;
     }
@@ -1775,89 +1765,175 @@ void finishPairing() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// RECOVERY — hold BOOT while powering on. For when tags or touch don't work,
-// so the normal admin path (which needs a parent tag and taps) is unreachable.
+// RECOVERY — press BOOT during the "Starting..." splash. For when tags, touch
+// or WiFi don't work, so the normal admin path (parent tag + taps) is out.
+// Every option works from the BOOT button alone (ButtonMenu): touch may be
+// exactly what's broken.
 // ═════════════════════════════════════════════════════════════════════════════
 
-void goRecovery() {
-    currentScreen = Screen::RECOVERY;
-    drawRecovery();
-}
+void runRecovery() {
+    uint8_t sel = 0;
+    while (true) {
+        char foot1[48], foot2[64];
+        snprintf(foot1, sizeof(foot1), "Tag reader: %s (0x%02X)",
+                 rfid.isOnline() ? "online" : "OFFLINE", rfid.version());
+        if (WiFi.status() == WL_CONNECTED)
+            snprintf(foot2, sizeof(foot2), "WiFi: %s  http://%s",
+                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        else
+            snprintf(foot2, sizeof(foot2), "WiFi: not connected");
 
-void drawRecovery() {
-    tft.fillScreen(C_BG);
-    tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(20, 20); tft.print("Recovery");
-    tft.setTextColor(C_TXT3); tft.setTextSize(1);
-    tft.setCursor(20, 45); tft.print("Let go of BOOT, then pick an option.");
-
-    tft.fillRoundRect(15, 70, 290, 80, 10, C_PRI);
-    tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(35, 92); tft.print("Re-pair family tags");
-    tft.setTextSize(1);
-    tft.setCursor(35, 120); tft.print("Keeps names, points and streaks");
-
-    tft.fillRoundRect(15, 160, 290, 80, 10, C_CARD);
-    tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(35, 182); tft.print("WiFi setup");
-    tft.setTextSize(1); tft.setTextColor(C_TXT2);
-    tft.setCursor(35, 210); tft.print("Pick a network, type the password");
-
-    tft.fillRoundRect(15, 250, 290, 80, 10, C_CARD);
-    tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(35, 272); tft.print("Calibrate touch");
-    tft.setTextSize(1); tft.setTextColor(C_TXT2);
-    tft.setCursor(35, 300); tft.print("Or press the BOOT button again");
-
-    tft.fillRoundRect(15, 410, 290, 50, 10, C_DIM);
-    tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(130, 427); tft.print("EXIT");
-
-    tft.setTextColor(C_TXT3); tft.setTextSize(1);
-    tft.setCursor(20, 345);
-    tft.printf("Reader: %s (0x%02X)", rfid.isOnline() ? "online" : "OFFLINE", rfid.version());
-    tft.setCursor(20, 360);
-    if (WiFi.status() == WL_CONNECTED) {
-        tft.printf("WiFi: %s", WiFi.SSID().c_str());
-        tft.setCursor(20, 375);
-        tft.printf("Web editor: http://%s", WiFi.localIP().toString().c_str());
-    } else {
-        tft.print("WiFi: not connected");
+        static const MenuItem items[] = {
+            { "Re-pair family tags", "New tags; keeps names, points, streaks", C_PRI },
+            { "WiFi setup",          "Pick a network, type the password",     C_CARD },
+            { "Calibrate touch",     "When taps land in the wrong place",     C_CARD },
+            { "Start setup over",    "Erase family, run the setup wizard",    0x8000 },
+            { "Exit",                "",                                      C_DIM },
+        };
+        sel = ButtonMenu::run("Recovery", items, 5, sel, foot1, foot2);
+        switch (sel) {
+            case 0: goPairTags(); return;
+            case 1: WifiSetup::run(); break;
+            case 2: runTouchCalibration(); break;
+            case 3:
+                if (confirmStartOver()) startSetupOver();   // restarts
+                break;
+            default: goHome(); return;
+        }
     }
 }
 
-void touchRecovery(uint16_t x, uint16_t y) {
-    if (y >= 70 && y <= 150)  { goPairTags(); return; }
-    if (y >= 160 && y <= 240) { WifiSetup::run(); drawRecovery(); return; }
-    if (y >= 250 && y <= 330) { runTouchCalibration(); drawRecovery(); return; }
-    if (y >= 410 && y <= 460) { goHome(); return; }
+bool confirmStartOver() {
+    static const MenuItem items[] = {
+        { "Cancel",            "Keep everything as it is",               C_DIM },
+        { "Erase and restart", "Names, tags, points, streaks are reset", 0x8000 },
+    };
+    return ButtonMenu::run("Start setup over?", items, 2, 0,
+                           "Chores and routines are kept. They're assigned",
+                           "by position: register people in the same order.") == 1;
 }
 
-// TFT_eSPI's corner-arrow routine reads raw touch values, so it works no matter
-// how far off the current calibration is. Result is stored on the SD card.
-void runTouchCalibration() {
-    // Wait for BOOT to be released so the press that got us here isn't
-    // mistaken for anything else.
-    while (digitalRead(PIN_BOOT_BUTTON) == LOW) delay(10);
+// Moves family.json aside (kept as family.json.old) and restarts; with no
+// family file (or its .bak) the station boots into the setup wizard.
+void startSetupOver() {
+    backups.flushNow(activeTasks, activeTaskCount, family, familyCount,
+        [](const Task* t, uint8_t c, const char* p){ storage.saveTasks(t, c, p); },
+        [](const FamilyMember* f, uint8_t c){ storage.saveFamily(f, c); });
+    if (SD.exists("/config/family.json.old")) SD.remove("/config/family.json.old");
+    if (SD.exists("/config/family.json")) SD.rename("/config/family.json", "/config/family.json.old");
+    if (SD.exists("/config/family.json.bak")) SD.remove("/config/family.json.bak");
+    Serial.println("[SETUP] Family erased (saved as family.json.old) - restarting into the wizard.");
 
     tft.fillScreen(C_BG);
     tft.setTextColor(C_TXT); tft.setTextSize(2);
-    tft.setCursor(40, 190); tft.print("Touch calibration");
-    tft.setTextColor(C_TXT2); tft.setTextSize(1);
-    tft.setCursor(40, 220); tft.print("Touch each corner arrow as it");
-    tft.setCursor(40, 234); tft.print("appears (a stylus works best).");
+    tft.setCursor(30, 220); tft.print("Restarting setup...");
+    delay(1500);
+    ESP.restart();
+}
 
-    uint16_t cal[5];
-    tft.calibrateTouch(cal, C_GOLD, C_BG, 15);
-    tft.setTouch(cal);
-    bool saved = storage.saveTouchCal(cal);
-    Serial.printf("[TOUCH] Calibrated: %u %u %u %u %u (%s)\n",
-                  cal[0], cal[1], cal[2], cal[3], cal[4], saved ? "saved" : "NOT saved");
+// Plausible output of TFT_eSPI::calibrateTouch: [x0, xRange, y0, yRange,
+// flags] on the XPT2046's 12-bit (0..4095) scale. A bad file would otherwise
+// make taps vanish: getTouch() drops anything that maps off-screen.
+bool touchCalPlausible(const uint16_t* cal) {
+    return cal[1] >= 1000 && cal[3] >= 1000 &&
+           cal[0] < 3000 && cal[2] < 3000 &&
+           (uint32_t)cal[0] + cal[1] <= 4300 && (uint32_t)cal[2] + cal[3] <= 4300 &&
+           cal[4] <= 7;
+}
 
-    tft.fillScreen(C_BG);
-    tft.setTextColor(C_OK); tft.setTextSize(2);
-    tft.setCursor(60, 220); tft.print("Touch calibrated");
-    delay(800);
+// Wait for one tap. Returns 1 hit inside the box, 0 miss / gave up,
+// 2 = BOOT held (accept the calibration anyway), 3 = BOOT pressed (redo).
+uint8_t waitTapInBox(int16_t bx, int16_t by, int16_t bw, int16_t bh) {
+    const int16_t SLOP = 15;
+    uint32_t start = millis(), pressedMs = 0, bootDownMs = 0;
+    bool bootArmed = digitalRead(PIN_BOOT_BUTTON) == HIGH, bootDown = false;
+    while (millis() - start < 20000) {
+        bool down = digitalRead(PIN_BOOT_BUTTON) == LOW;
+        if (!down) {
+            if (bootDown && bootArmed && millis() - bootDownMs >= 30) return 3;
+            bootDown = false; bootArmed = true;
+        } else if (bootArmed) {
+            if (!bootDown) { bootDown = true; bootDownMs = millis(); }
+            else if (millis() - bootDownMs >= ButtonMenu::HOLD_MS) return 2;
+        }
+
+        uint16_t x, y;
+        if (tft.getTouch(&x, &y)) {
+            Serial.printf("[TOUCH] test tap at %u,%u\n", x, y);
+            bool hit = x >= bx - SLOP && x <= bx + bw + SLOP && y >= by - SLOP && y <= by + bh + SLOP;
+            tft.fillCircle(x, y, 5, hit ? C_OK : C_ERR);    // show where it landed
+            uint32_t t = millis();                           // wait for release
+            while (tft.getTouchRawZ() > 300 && millis() - t < 3000) delay(15);
+            delay(300);
+            return hit ? 1 : 0;
+        }
+        // Pressed, but the calibration maps it off the screen: a miss
+        if (tft.getTouchRawZ() > 600) {
+            if (!pressedMs) pressedMs = millis();
+            else if (millis() - pressedMs > 250) {
+                Serial.println("[TOUCH] test tap mapped off-screen");
+                return 0;
+            }
+        } else pressedMs = 0;
+        delay(15);
+    }
+    return 0;
+}
+
+// TFT_eSPI's corner-arrow routine reads raw touch values, so it works no matter
+// how far off the current calibration is. The result is then checked with two
+// test taps and only saved if they land where they should.
+void runTouchCalibration() {
+    // Let go of BOOT first so the press that got us here isn't misread
+    uint32_t t0 = millis();
+    while (digitalRead(PIN_BOOT_BUTTON) == LOW && millis() - t0 < 5000) delay(10);
+
+    while (true) {
+        tft.fillScreen(C_BG);
+        tft.setTextColor(C_TXT); tft.setTextSize(2);
+        tft.setCursor(40, 190); tft.print("Touch calibration");
+        tft.setTextColor(C_TXT2); tft.setTextSize(1);
+        tft.setCursor(40, 220); tft.print("Touch each corner arrow as it");
+        tft.setCursor(40, 234); tft.print("appears (a stylus works best).");
+
+        uint16_t cal[5];
+        tft.calibrateTouch(cal, C_GOLD, C_BG, 15);
+        tft.setTouch(cal);
+        Serial.printf("[TOUCH] Calibration values: %u %u %u %u %u\n", cal[0], cal[1], cal[2], cal[3], cal[4]);
+
+        // Two test targets in opposite quarters check both axes
+        static const int16_t BOX[2][2] = { { 40, 80 }, { 200, 330 } };
+        uint8_t result = touchCalPlausible(cal) ? 1 : 0;
+        for (uint8_t i = 0; i < 2 && result == 1; i++) {
+            tft.fillScreen(C_BG);
+            tft.setTextColor(C_TXT); tft.setTextSize(2);
+            tft.setCursor(20, 20); tft.print("Check: tap the box");
+            tft.setTextColor(C_TXT3); tft.setTextSize(1);
+            tft.setCursor(20, 445); tft.print("BOOT: press = redo calibration");
+            tft.setCursor(20, 459); tft.print("      hold 1 second = keep it anyway");
+            tft.fillRoundRect(BOX[i][0], BOX[i][1], 80, 80, 8, C_PRI);
+            tft.drawRoundRect(BOX[i][0] - 2, BOX[i][1] - 2, 84, 84, 9, C_TXT);
+            result = waitTapInBox(BOX[i][0], BOX[i][1], 80, 80);
+        }
+
+        if (result == 1 || result == 2) {
+            bool saved = storage.saveTouchCal(cal);
+            Serial.printf("[TOUCH] Calibration %s (%s)\n", result == 1 ? "verified" : "kept by BOOT",
+                          saved ? "saved" : "NOT saved");
+            tft.fillScreen(C_BG);
+            tft.setTextColor(C_OK); tft.setTextSize(2);
+            tft.setCursor(60, 220); tft.print("Touch calibrated");
+            delay(800);
+            return;
+        }
+
+        tft.fillScreen(C_BG);
+        tft.setTextColor(C_WARN); tft.setTextSize(2);
+        tft.setCursor(20, 200); tft.print("Taps didn't line up.");
+        tft.setTextColor(C_TXT2);
+        tft.setCursor(20, 230); tft.print("Let's redo it.");
+        delay(1500);
+    }
 }
 
 // In-progress timers survive a reboot: tasks store the wall-clock start time,

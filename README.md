@@ -107,7 +107,7 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
    - Review and save
    - Device reboots into normal mode
 
-**Lost or new tags, new WiFi, or touch way off?** Press and hold the BOOT button while "Starting..." shows to open **recovery mode**: re-pair tags (keeps names and points), WiFi setup, or recalibrate touch. Admin → Family Settings → "Re-pair tags" does the same from a parent's dashboard. An unregistered tag shows "Unknown tag" plus its ID, and the web editor's Family tab can assign it with one tap.
+**Lost or new tags, new WiFi, touch way off, or want to start over?** Press and hold the BOOT button while "Starting..." shows to open **recovery mode** (works with just the BOOT button: press = next, hold = select): re-pair tags (keeps names and points), WiFi setup, recalibrate touch, or start setup over. Admin → Family Settings → "Re-pair tags" does the same from a parent's dashboard. An unregistered tag shows "Unknown tag" plus its ID, and the web editor's Family tab can assign it with one tap.
 
 ## Daily Operation
 
