@@ -1,0 +1,52 @@
+{
+  "routines": [
+    {
+      "id": 1,
+      "name": "School Morning",
+      "assigned": 254,
+      "points": 2,
+      "startHour": 6,
+      "endHour": 9,
+      "recurDays": 62,
+      "steps": [
+        "Get dressed",
+        "Make Bed/Tidy Room",
+        "Eat breakfast",
+        "Cleanup",
+        "Pack backpack (Instrument?)",
+        "Shoes (& Socks) on"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Bedtime",
+      "assigned": 254,
+      "points": 2,
+      "startHour": 19,
+      "endHour": 22,
+      "recurDays": 127,
+      "steps": [
+        "Put on pajamas",
+        "Tidy Playroom",
+        "Tidy Bedroom",
+        "Reading (Glass of Water?)"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "After School",
+      "assigned": 254,
+      "points": 2,
+      "startHour": 16,
+      "endHour": 22,
+      "recurDays": 62,
+      "steps": [
+        "Shoes Off and Neat",
+        "Check backpack: forms & notices",
+        "Hang Backpack",
+        "Homework & Reading",
+        "Pack & Zip Backpack"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "ssid": "YourWiFiNetwork",
+  "password": "YourWiFiPassword",
+  "gmtOffset": -28800,
+  "dstOffset": 3600,
+  "webPin": ""
+}

@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and libraries (pinned to tested versions)
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+          arduino-cli lib install "TFT_eSPI@2.5.43" "MFRC522@1.4.12" "ArduinoJson@7.4.3"
+
+      - name: Use this repo's TFT_eSPI config
+        run: cp User_Setup.h "$(arduino-cli config get directories.user)/libraries/TFT_eSPI/User_Setup.h"
+
+      - name: Compile
+        run: arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings default ChoreStation
+
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keyboard layout test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I ChoreStation test/keyboard_layout_test.cpp -o kbt
+          ./kbt
+      - name: Touch + tone logic test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I ChoreStation test/input_logic_test.cpp -o ilt
+          ./ilt
+      - name: Firmware version logic test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I ChoreStation test/ota_logic_test.cpp -o olt
+          ./olt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Web editor contract test
+        working-directory: test
+        run: |
+          npm init -y >/dev/null
+          npm install jsdom
+          node web_ui_contract.test.js

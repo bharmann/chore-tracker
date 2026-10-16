@@ -1,0 +1,5 @@
+.DS_Store
+*.DS_Store
+scratchpad/
+test/node_modules/
+test/package*.json

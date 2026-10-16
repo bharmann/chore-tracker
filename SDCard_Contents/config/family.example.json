@@ -1,0 +1,36 @@
+{
+  "members": [
+    {
+      "name": "Dad",
+      "role": "parent",
+      "uid": "AA:BB:CC:DD",
+      "dailyGoal": 3,
+      "totalPoints": 0,
+      "streak": 0
+    },
+    {
+      "name": "Mom",
+      "role": "parent",
+      "uid": "11:22:33:44",
+      "dailyGoal": 3,
+      "totalPoints": 0,
+      "streak": 0
+    },
+    {
+      "name": "Alex",
+      "role": "child",
+      "uid": "DE:AD:BE:EF",
+      "dailyGoal": 5,
+      "totalPoints": 0,
+      "streak": 0
+    },
+    {
+      "name": "Jordan",
+      "role": "child",
+      "uid": "CA:FE:BA:BE",
+      "dailyGoal": 5,
+      "totalPoints": 0,
+      "streak": 0
+    }
+  ]
+}
