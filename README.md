@@ -1,6 +1,6 @@
 # Family Chore Station
 
-**Hardware:** E32R40T (ESP32-32E + ST7796 4" TFT) + RFID-RC522  
+**Hardware:** E32R40T (ESP32-32E + ST7796 4" TFT - AKA ESP32 ‘CYD’ - Cheap Yellow Display) + RFID-RC522  
 **Framework:** Arduino (Arduino IDE / arduino-cli; migrated off PlatformIO)  
 **Project Size:** ~8,200 lines across 21 source files
 
