@@ -7,19 +7,34 @@ name: Release
 #   version.json           {"version","size","sha256"} the station checks first
 #   ChoreStation-full.bin  bootloader + partitions + app, for a USB flash at 0x0
 #                          (esptool.py write_flash 0x0 ChoreStation-full.bin)
+#
+# No git needed: Actions > Release > Run workflow, type the version (e.g.
+# v1.4.1), and it releases the latest main under that tag.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. v1.4.1 (must be newer than the last one)'
+        required: true
 
 permissions:
   contents: write
+
+env:
+  VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "Version must look like v1.4.1, got '$VERSION'"; exit 1; }
 
       - uses: arduino/setup-arduino-cli@v2
 
@@ -36,7 +51,7 @@ jobs:
 
       - name: Stamp the version into the firmware
         run: |
-          printf '#pragma once\n#define FW_VERSION "%s"\n' "$GITHUB_REF_NAME" > ChoreStation/version.h
+          printf '#pragma once\n#define FW_VERSION "%s"\n' "$VERSION" > ChoreStation/version.h
           cat ChoreStation/version.h
 
       - name: Compile
@@ -48,12 +63,12 @@ jobs:
           cp out/ChoreStation.ino.merged.bin ChoreStation-full.bin
           SIZE=$(stat -c%s ChoreStation.bin)
           SHA=$(sha256sum ChoreStation.bin | cut -d' ' -f1)
-          printf '{"version":"%s","size":%s,"sha256":"%s"}\n' "$GITHUB_REF_NAME" "$SIZE" "$SHA" > version.json
+          printf '{"version":"%s","size":%s,"sha256":"%s"}\n' "$VERSION" "$SIZE" "$SHA" > version.json
           cat version.json
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" ChoreStation.bin version.json ChoreStation-full.bin \
-            --title "$GITHUB_REF_NAME" --generate-notes
+          gh release create "$VERSION" ChoreStation.bin version.json ChoreStation-full.bin \
+            --target "$GITHUB_SHA" --title "$VERSION" --generate-notes
