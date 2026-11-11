@@ -1,0 +1,27 @@
+#!/bin/sh
+# Secret scan on every commit. FAIL CLOSED: a scanner that cannot run is not a clean scan.
+# A hit means ROTATE the credential -- once committed, the value is in the object store,
+# and --no-verify past this makes that permanent.
+set -u
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit REFUSED: gitleaks is not installed (brew install gitleaks)." >&2
+  exit 1
+fi
+
+# --redact keeps the secret itself out of the terminal; --exit-code 20 separates
+# "found something" from "could not run" (gitleaks' own errors exit 1).
+gitleaks git --staged --redact --no-banner --exit-code 20 .
+status=$?
+
+case "$status" in
+  0) exit 0 ;;
+  20)
+    echo "pre-commit REFUSED: staged content matched a secret rule. Rotate it; do not just unstage it." >&2
+    exit 1
+    ;;
+  *)
+    echo "pre-commit REFUSED: gitleaks could not run (exit $status). Fix the scanner; do not bypass it." >&2
+    exit 1
+    ;;
+esac

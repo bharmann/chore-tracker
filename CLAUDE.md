@@ -69,3 +69,22 @@ SD layout (`SDCard_Contents/` is the seed): `/config/wifi.json` (WiFi + timezone
 ## Not Yet Built
 
 Voice input, push notifications / remote dashboard (on hold — owner is evaluating options; the on-device web UI covers LAN editing), collaborative tasks.
+
+## Guardrails
+
+- `.githooks/pre-commit` runs gitleaks on every commit and fails closed. After a fresh clone:
+  `git config core.hooksPath .githooks`. A hit means rotate the credential; never `--no-verify`.
+- Stage named files, never `git add -A`.
+
+## Contract with Lyra
+
+Standalone: Lyra does not call this repo. The vault note is the only link, and project-tracker reads it.
+- This repo never reads secondbrain's `.env`, never imports its modules, and never writes its vault. Lyra-side
+  changes are made in a secondbrain session, through that repo's own gates.
+- The seam below is the only coupling. Changing it is a breaking change for Lyra, and is said so in the commit.
+- Project status lives in Lyra's vault note (projects/personal/chore-station.md); tag tasks for this repo `#personal/chore-station`.
+- History flows back by PULL, never push: Lyra's project-activity job (in secondbrain) reads this repo's git log
+  (hash, time, subject) and the Claude Code session METADATA for sessions run here (title, times, prompt count,
+  lines changed, files edited — never conversation text) and regenerates the `## Project activity` section of
+  projects/personal/chore-station.md. So write commit subjects that say what changed, and `/rename` a session whose auto-title would not —
+  those two are what the vault keeps. Nothing to run from here. → /Volumes/Overflow/secondbrain/.agents/plans/project-activity-pull-2026-11-11.md
