@@ -41,6 +41,7 @@
 #include "time_manager.h"
 #include "routine_manager.h"
 #include "scheduler.h"
+#include "allowance_manager.h"
 #include "ota_update.h"
 #include "parent_admin.h"
 #include "web_server.h"
@@ -72,6 +73,7 @@ BackupManager  backups;
 TimeManager    timeMan;
 RoutineManager routines;
 Scheduler      scheduler;
+AllowanceManager allowance;     // weekly allowance for doing the required chores
 ParentAdmin    admin;
 WebUI          web;
 OtaUpdater     ota;             // firmware updates from GitHub releases
@@ -165,9 +167,18 @@ static const int16_t JOB_BTN_X = 226;                // "+ Job" button left edge
 enum class Screen : uint8_t {
     HOME, DASHBOARD, TASK_DETAIL, SELF_INIT, QUICK_ADD,
     PARENT_ADMIN, MILESTONES, ROUTINE, SETUP,
-    NO_SD, PAIR_TAGS, DONE_PROMPT, NEWS
+    NO_SD, PAIR_TAGS, DONE_PROMPT, NEWS,
+    ALLOWANCE, ALLOWANCE_FAMILY
 };
 Screen currentScreen = Screen::HOME;
+
+// Allowance screen: whose money is shown, and whether a parent opened it
+// from the family overview (Back returns there instead of the dashboard).
+uint8_t allowMember = 255;
+bool    allowFromFamily = false;
+static const int16_t ALLOW_BTN_X0 = 104, ALLOW_BTN_X1 = 220;   // dashboard bottom-middle button
+static const int16_t AF_CARD_Y = 60, AF_CARD_H = 74, AF_CARD_PITCH = 82;  // family overview cards
+uint32_t lastAutoOtaMs = 0;     // nightly automatic update attempt
 
 // Routine session state (one routine walked at a time)
 int8_t viewingRoutineIdx = -1;
@@ -290,6 +301,14 @@ void touchDashboard(uint16_t x, uint16_t y);
 void touchTaskDetail(uint16_t x, uint16_t y);
 void touchSelfInit(uint16_t x, uint16_t y);
 void touchQuickAdd(uint16_t x, uint16_t y);
+void goAllowance(uint8_t member, bool fromFamily);
+void goAllowanceFamily();
+void drawAllowance();
+void touchAllowance(uint16_t x, uint16_t y);
+void drawAllowanceFamily();
+void touchAllowanceFamily(uint16_t x, uint16_t y);
+void drawAllowanceButton(bool isParent);
+void drawWeekDots(uint8_t m, int16_t x, int16_t y, int16_t pitch, int16_t r, bool letters);
 
 void showMsg(const char* msg, uint16_t color, uint16_t durationMs = 1200);
 bool runOtaInstall();
@@ -362,6 +381,7 @@ void setup() {
     audio.begin();
     for (uint8_t m = 0; m < MAX_FAMILY_MEMBERS; m++) clearNews(m);
     scheduler.onStreakBonus = onStreakBonus;
+    scheduler.onDayClosing = [](const char* date) { allowance.closeDay(date); };
     SPI.begin(PIN_VSPI_CLK, PIN_VSPI_MISO, PIN_VSPI_MOSI);
     bool sdOk = storage.begin();
     rfid.begin();
@@ -413,6 +433,7 @@ void setup() {
         routines.begin();
         scheduler.begin();
         if (activeTaskCount == 0) scheduler.generateRecurringTasks();
+        allowance.begin();             // after routines + chores (it looks them up)
         web.begin(timeMan.webPin());   // parent web editor (reachable once WiFi is up)
         if (bootHeld) runRecovery();
         else          goHome();
@@ -494,6 +515,7 @@ void loop() {
     if (display.needsRedraw()) {
         if (currentScreen == Screen::HOME) drawHome();
         else if (currentScreen == Screen::DASHBOARD) drawDashboard();
+        else if (currentScreen == Screen::ALLOWANCE || currentScreen == Screen::ALLOWANCE_FAMILY) redrawCurrent();
     }
 
     // Timers below run whether or not the screen is lit: a time limit must
@@ -578,7 +600,8 @@ void loop() {
         // a longer timeout but are never left open indefinitely.
         uint32_t idle = millis() - lastActivityMs;
         bool quickLock = currentScreen == Screen::DASHBOARD || currentScreen == Screen::MILESTONES ||
-                         currentScreen == Screen::DONE_PROMPT || currentScreen == Screen::NEWS;
+                         currentScreen == Screen::DONE_PROMPT || currentScreen == Screen::NEWS ||
+                         currentScreen == Screen::ALLOWANCE || currentScreen == Screen::ALLOWANCE_FAMILY;
         bool routineLock = currentScreen == Screen::ROUTINE;
         bool slowLock  = currentScreen == Screen::PARENT_ADMIN || currentScreen == Screen::SELF_INIT ||
                          currentScreen == Screen::QUICK_ADD || currentScreen == Screen::PAIR_TAGS;
@@ -597,12 +620,31 @@ void loop() {
         if (currentScreen == Screen::TASK_DETAIL || currentScreen == Screen::DONE_PROMPT) goDashboard(currentUserId);
         else if (currentScreen == Screen::DASHBOARD) drawDashboard();
     }
+    if (allowance.update()) {          // a week just ended (paid or missed)
+        if (currentScreen == Screen::DASHBOARD || currentScreen == Screen::ALLOWANCE ||
+            currentScreen == Screen::ALLOWANCE_FAMILY) redrawCurrent();
+    }
 
     // Firmware: look for a newer release now and then, only while nobody is
     // using the station (the check blocks for a second or two).
     if (currentScreen == Screen::HOME && millis() - lastActivityMs > 60000 && ota.checkDue()) {
         ota.check();
         if (currentScreen == Screen::HOME) drawHome();
+    }
+
+    // ...and install it by itself in the middle of the night, when nobody has
+    // touched the station for 10 minutes (one try per night; a parent can
+    // still install any time from Admin > System Info or the web editor).
+    if (ota.updateAvailable() && currentScreen == Screen::HOME && timeMan.isTimeSynced() &&
+        millis() - lastActivityMs > 600000 &&
+        (lastAutoOtaMs == 0 || millis() - lastAutoOtaMs > 20UL * 3600 * 1000)) {
+        uint8_t h = timeMan.currentHour();
+        if (h >= 2 && h < 4) {
+            lastAutoOtaMs = millis();
+            Serial.println("[OTA] Nightly automatic update.");
+            runOtaInstall();           // restarts on success
+            goHome();
+        }
     }
 
     // Web editor: serve requests, then apply any saves without a reboot.
@@ -626,6 +668,11 @@ void loop() {
         if (currentScreen == Screen::TASK_DETAIL || currentScreen == Screen::DONE_PROMPT)
             goDashboard(currentUserId);   // index may have moved
         else if (currentScreen == Screen::DASHBOARD || currentScreen == Screen::HOME) redrawCurrent();
+    }
+    if (web.allowanceChanged) {
+        web.allowanceChanged = false;
+        if (currentScreen == Screen::DASHBOARD || currentScreen == Screen::ALLOWANCE ||
+            currentScreen == Screen::ALLOWANCE_FAMILY) redrawCurrent();
     }
     if (web.familyChanged) {
         web.familyChanged = false;
@@ -760,6 +807,7 @@ void parentRedo(uint8_t taskIdx) {
         AwayNews& n = news[who];
         if (n.redos++ == 0) strlcpy(n.redoName, task.name, sizeof(n.redoName));
     }
+    if (task.type == TaskType::RECURRING && who < familyCount) allowance.noteUndone(who, task.id);
     TaskEngine::rejectTask(task);
     scheduler.settleRejected(taskIdx);   // may remove it (today's copy is the redo)
     backups.markTasksDirty();
@@ -806,6 +854,7 @@ void finishTaskFor(uint8_t taskIdx, uint8_t memberId) {
     TransitionResult r = TaskEngine::completeTask(task, memberId, taskIdx);
     if (!r.success) { audio.errorTone(); showMsg(r.message, C_WARN, 1500); return; }   // e.g. not enough time yet
 
+    if (task.type == TaskType::RECURRING) allowance.noteDone(memberId, task.id);   // counts toward the allowance day
     bool claim = task.noReminderToggled;
     TransitionResult r2 = TaskEngine::submitClaim(task, family[memberId], claim);
     backups.markTasksDirty(); backups.markFamilyDirty();
@@ -857,6 +906,8 @@ void handleTouch(uint16_t x, uint16_t y) {
         case Screen::PAIR_TAGS:   touchPairTags(x, y); break;
         case Screen::DONE_PROMPT: touchDonePrompt(x, y); break;
         case Screen::NEWS:        touchNews(x, y); break;
+        case Screen::ALLOWANCE:   touchAllowance(x, y); break;
+        case Screen::ALLOWANCE_FAMILY: touchAllowanceFamily(x, y); break;
         case Screen::PARENT_ADMIN:
             if (admin.handleTouch(x, y)) goDashboard(currentUserId);
             else if (admin.wantsPairTags) { admin.wantsPairTags = false; goPairTags(); }
@@ -923,6 +974,13 @@ void touchDashboard(uint16_t x, uint16_t y) {
 
     // Bye (padlock): back to the scan screen so nobody else can use this dashboard
     if (x < 100 && y >= 436) { goHome(); return; }
+
+    // Money (bottom-middle): a child's allowance, or the family overview
+    if (x >= ALLOW_BTN_X0 && x < ALLOW_BTN_X1 && y >= 436) {
+        if (isParent) goAllowanceFamily();
+        else          goAllowance(currentUserId, false);
+        return;
+    }
 
     // Pager (Back / More, right under the cards)
     uint8_t tp = totalPages();
@@ -1074,6 +1132,7 @@ void finishRoutine(uint8_t idx, uint8_t member) {
     m.totalPoints += rt.bundlePoints;
     m.dailyTasksCompleted++;
     routines.markDone(idx, m.id);
+    allowance.noteDone(m.id, AllowanceManager::ROUTINE_KEY + rt.id);
 
     // Milestone check (same rule as task completion)
     int8_t ms = -1;
@@ -1674,6 +1733,8 @@ void redrawCurrent() {
         case Screen::PAIR_TAGS:    drawPairTags(); break;
         case Screen::DONE_PROMPT:  drawDonePrompt(); break;
         case Screen::NEWS:         drawNews(); break;
+        case Screen::ALLOWANCE:    drawAllowance(); break;
+        case Screen::ALLOWANCE_FAMILY: drawAllowanceFamily(); break;
         case Screen::NO_SD:        drawNoSd(); break;
         default: break;
     }
@@ -2207,6 +2268,8 @@ void drawDashboard() {
     tft.drawRoundRect(23, 448, 7, 10, 3, C_TXT2);
     tft.fillRoundRect(20, 455, 13, 10, 2, C_TXT2);       // padlock body (covers shackle ends)
     txt("Bye", 62, 456, 4, C_TXT, MC_DATUM);
+
+    drawAllowanceButton(isParent);
 
     if (msgActive) drawMsgOverlay();   // a redraw under a message keeps it visible
 }
@@ -2839,4 +2902,205 @@ void reloadRecurringTemplates() {
 
 void generateTodaysRecurring() {
     scheduler.generateRecurringTasks();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ALLOWANCE — a child's savings, this week's days, history (allowance_manager.h)
+// Read-only on the station; parents change things in the web editor.
+// ═════════════════════════════════════════════════════════════════════════════
+
+void goAllowance(uint8_t member, bool fromFamily) {
+    allowMember = member; allowFromFamily = fromFamily;
+    currentScreen = Screen::ALLOWANCE; lastActivityMs = millis();
+    drawAllowance();
+}
+
+void goAllowanceFamily() {
+    currentScreen = Screen::ALLOWANCE_FAMILY; lastActivityMs = millis();
+    drawAllowanceFamily();
+}
+
+// Dashboard bottom-middle: the child's balance / "Money" for a parent
+void drawAllowanceButton(bool isParent) {
+    int16_t w = ALLOW_BTN_X1 - ALLOW_BTN_X0 - 4;
+    tft.fillRoundRect(ALLOW_BTN_X0, 440, w, 32, 6, C_CARD);
+    tft.drawRoundRect(ALLOW_BTN_X0, 440, w, 32, 6, C_OK);
+    int16_t cx = ALLOW_BTN_X0 + w / 2;
+    if (isParent || currentUserId >= familyCount) { txt("$ Money", cx, 456, 2, C_OK, MC_DATUM); return; }
+    char b[16]; alFormatCents(allowance.balance(currentUserId), b, sizeof(b));
+    if (tft.textWidth(b, 4) <= w - 8) txt(b, cx, 457, 4, C_OK, MC_DATUM);
+    else                              txt(b, cx, 456, 2, C_OK, MC_DATUM);
+}
+
+// Seven day circles, Sunday first. Green = good day, red = missed, gold ring =
+// today (not finished yet), grey ring = still to come.
+void drawWeekDots(uint8_t m, int16_t x, int16_t y, int16_t pitch, int16_t r, bool letters) {
+    static const char* L[] = {"S", "M", "T", "W", "T", "F", "S"};
+    for (uint8_t i = 0; i < 7; i++) {
+        int16_t cx = x + i * pitch;
+        uint16_t fill = C_BG, ring = C_DIM, tc = C_TXT3;
+        switch (allowance.dayState(m, i)) {
+            case AllowanceManager::DAY_OK:     fill = C_OK;  ring = C_OK;  tc = C_BG; break;
+            case AllowanceManager::DAY_MISSED: fill = C_ERR; ring = C_ERR; tc = C_TXT; break;
+            case AllowanceManager::DAY_TODAY:  ring = C_GOLD; tc = C_GOLD; break;
+            case AllowanceManager::DAY_NOT_TRACKED: fill = C_CARD; break;
+            default: break;
+        }
+        tft.fillCircle(cx, y, r, fill);
+        tft.drawCircle(cx, y, r, ring);
+        if (ring == C_GOLD) tft.drawCircle(cx, y, r - 1, ring);
+        if (letters) txt(L[i], cx, y + 1, 2, tc, MC_DATUM);
+    }
+}
+
+void drawAllowance() {
+    uint8_t m = allowMember;
+    if (m >= familyCount) { goHome(); return; }
+    tft.fillScreen(C_BG);
+
+    // Header
+    tft.fillRect(0, 0, 320, 44, C_CARD);
+    txt("<", 16, 22, 4, C_TXT2, ML_DATUM);
+    char title[32]; snprintf(title, sizeof(title), "%s's money", family[m].name);
+    txtFit(title, 40, 10, 270, 4, C_TXT);
+
+    // Balance
+    tft.fillRoundRect(10, 52, 300, 78, 8, C_CARD);
+    txt("Saved up", 160, 58, 2, C_TXT2, TC_DATUM);
+    char bal[16]; alFormatCents(allowance.balance(m), bal, sizeof(bal));
+    tft.setTextSize(2); tft.setTextColor(C_OK); tft.setTextDatum(TC_DATUM);
+    tft.drawString(bal, 160, 76, 4);
+    tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+
+    // This week
+    tft.fillRoundRect(10, 138, 300, 100, 8, C_CARD);
+    char amt[12]; alFormatCents(allowance.cents(), amt, sizeof(amt));
+    char head[40]; snprintf(head, sizeof(head), "This week: %s allowance", amt);
+    txt(head, 20, 144, 2, C_TXT, TL_DATUM);
+    drawWeekDots(m, 46, 184, 38, 15, true);
+
+    char line[48]; uint16_t lc = C_TXT2;
+    if (!allowance.knowsDate()) {
+        strlcpy(line, "Waiting for the clock (WiFi)", sizeof(line));
+    } else if (!allowance.started()) {
+        char d[12]; alFormatShort(allowance.week(), d, sizeof(d));
+        snprintf(line, sizeof(line), "Starts Sunday %s - get ready!", d);
+        lc = C_GOLD;
+    } else if (allowance.requiredCount() == 0) {
+        strlcpy(line, "Ask a parent to pick the chores", sizeof(line));
+    } else {
+        uint8_t good = allowance.goodDays(m), left = allowance.daysLeft(m), need = allowance.need();
+        if (good >= need)              { snprintf(line, sizeof(line), "You earned it! %s on Sunday", amt); lc = C_OK; }
+        else if (good + left < need)   { strlcpy(line, "Missed a day - try again next week", sizeof(line)); lc = C_WARN; }
+        else if (need == 7)            { snprintf(line, sizeof(line), "%d of 7 days done - keep going!", good); lc = C_TXT; }
+        else                           { snprintf(line, sizeof(line), "%d of %d days done - keep going!", good, need); lc = C_TXT; }
+    }
+    txt(line, 160, 210, 2, lc, TC_DATUM);
+
+    // Today's required chores
+    int16_t y = 246;
+    txt("TODAY", 14, y, 1, C_TXT2, TL_DATUM);
+    y += 12;
+    uint16_t keys[6]; bool done[6];
+    uint8_t n = allowance.started() ? allowance.todayItems(m, keys, done, 6) : 0;
+    if (n == 0) {
+        txt(allowance.started() ? "Nothing required today" : "-", 20, y + 4, 2, C_TXT3, TL_DATUM);
+        y += 26;
+    }
+    for (uint8_t k = 0; k < n && k < 4; k++) {
+        if (done[k]) Icons::drawCheckIcon(16, y + 2, C_OK, 18);
+        else { tft.drawCircle(25, y + 11, 8, C_GOLD); }
+        txtFit(allowance.itemName(keys[k]), 44, y + 2, 260, 2, done[k] ? C_TXT3 : C_TXT);
+        y += 24;
+    }
+
+    // History (newest first)
+    y = max<int16_t>(y + 6, 340);
+    txt("HISTORY", 14, y, 1, C_TXT2, TL_DATUM);
+    y += 12;
+    JsonObject e;
+    uint8_t shown = 0;
+    for (uint16_t i = 0; shown < 4 && allowance.logEntry(m, i, e) && y < 426; i++, shown++) {
+        char d[12], a[14], what[40];
+        alFormatShort(e["day"] | (int32_t)0, d, sizeof(d));
+        int32_t c = e["a"] | (int32_t)0;
+        alFormatCents(c, a, sizeof(a));
+        uint16_t col = C_TXT;
+        if (strcmp(e["k"] | "", "w") == 0) {
+            bool paid = e["paid"] | false;
+            snprintf(what, sizeof(what), "Week of %s %s", d, paid ? "- earned" : "- missed");
+            col = paid ? C_OK : C_ERR;
+            if (!paid) strlcpy(a, "$0", sizeof(a));
+        } else {
+            const char* note = e["n"] | "";
+            snprintf(what, sizeof(what), "%s %s", d, note[0] ? note : (c < 0 ? "Spent" : "Added"));
+            col = c < 0 ? C_WARN : C_OK;
+            if (c > 0) { char t[14]; snprintf(t, sizeof(t), "+%s", a); strlcpy(a, t, sizeof(a)); }
+        }
+        txtFit(what, 16, y, 210, 2, C_TXT);
+        txt(a, 304, y, 2, col, TR_DATUM);
+        y += 20;
+    }
+    if (shown == 0) txt("Nothing yet", 16, y, 2, C_TXT3, TL_DATUM);
+
+    // Back
+    tft.fillRoundRect(10, 440, 120, 32, 6, C_CARD);
+    tft.drawRoundRect(10, 440, 120, 32, 6, C_TXT3);
+    txt("< Back", 70, 456, 2, C_TXT, MC_DATUM);
+
+    if (msgActive) drawMsgOverlay();
+}
+
+void touchAllowance(uint16_t x, uint16_t y) {
+    lastActivityMs = millis();
+    if ((y < 48 && x < 120) || (y >= 436 && x < 140)) {
+        if (allowFromFamily) goAllowanceFamily();
+        else                 goDashboard(currentUserId);
+    }
+}
+
+// Parent: every child's balance and week at a glance; tap one for details.
+void drawAllowanceFamily() {
+    tft.fillScreen(C_BG);
+    tft.fillRect(0, 0, 320, 44, C_CARD);
+    txt("<", 16, 22, 4, C_TXT2, ML_DATUM);
+    txt("Allowance", 40, 10, 4, C_TXT, TL_DATUM);
+
+    int16_t y = AF_CARD_Y;
+    for (uint8_t m = 0; m < familyCount; m++) {
+        if (family[m].role != Role::CHILD) continue;
+        if (y + AF_CARD_H > 400) break;
+        tft.fillRoundRect(10, y, 300, AF_CARD_H, 8, C_CARD);
+        txtFit(family[m].name, 20, y + 6, 160, 4, C_TXT);
+        char b[16]; alFormatCents(allowance.balance(m), b, sizeof(b));
+        txt(b, 300, y + 6, 4, C_OK, TR_DATUM);
+        drawWeekDots(m, 30, y + 52, 24, 9, false);
+        if (allowance.started()) {
+            char g[16]; snprintf(g, sizeof(g), "%d/7 days", allowance.goodDays(m));
+            txt(g, 300, y + 46, 2, C_TXT2, TR_DATUM);
+        }
+        y += AF_CARD_PITCH;
+    }
+    txt("Override weeks, fix a missed chore,", 160, 404, 1, C_TXT2, TC_DATUM);
+    char u[48];
+    if (WiFi.status() == WL_CONNECTED) snprintf(u, sizeof(u), "record spending: http://%s", WiFi.localIP().toString().c_str());
+    else                               strlcpy(u, "record spending: web editor (needs WiFi)", sizeof(u));
+    txt(u, 160, 418, 1, C_TXT2, TC_DATUM);
+
+    tft.fillRoundRect(10, 440, 120, 32, 6, C_CARD);
+    tft.drawRoundRect(10, 440, 120, 32, 6, C_TXT3);
+    txt("< Back", 70, 456, 2, C_TXT, MC_DATUM);
+    if (msgActive) drawMsgOverlay();
+}
+
+void touchAllowanceFamily(uint16_t x, uint16_t y) {
+    lastActivityMs = millis();
+    if ((y < 48 && x < 120) || (y >= 436 && x < 140)) { goDashboard(currentUserId); return; }
+    int16_t cy = AF_CARD_Y;
+    for (uint8_t m = 0; m < familyCount; m++) {
+        if (family[m].role != Role::CHILD) continue;
+        if (cy + AF_CARD_H > 400) break;
+        if (y >= cy && y < cy + AF_CARD_H) { goAllowance(m, true); return; }
+        cy += AF_CARD_PITCH;
+    }
 }

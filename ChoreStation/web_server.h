@@ -23,6 +23,9 @@
 //   POST /api/routines   → replace /config/routines.json (validated)
 //   GET  /api/tasks      → current /tasks/recurring.json
 //   POST /api/tasks      → replace /tasks/recurring.json (validated)
+//   GET  /api/allowance  → allowance settings, each child's balance, week, history
+//   POST /api/allowance  → one parent action: {"op":"settings"|"start"|"mark"|
+//                          "override"|"money"|"delete", ...} (allowance_manager.h)
 //
 // Auth: optional. If /config/wifi.json has "webPin", every request needs HTTP
 // Basic auth (user "parent", password = the PIN). Without it the editor is
@@ -41,6 +44,7 @@
 #include "backup_manager.h"
 #include "rfid_manager.h"
 #include "ota_update.h"
+#include "allowance_manager.h"
 
 extern StorageManager storage;
 extern BackupManager  backups;
@@ -51,6 +55,7 @@ extern uint8_t        lastUnknownLen;
 extern uint32_t       lastUnknownMs;
 
 extern OtaUpdater ota;
+extern AllowanceManager allowance;
 
 class WebUI {
 public:
@@ -60,6 +65,7 @@ public:
     bool pendingRoutineReload = false;
     bool familyChanged        = false;   // main loop redraws name-bearing screens
     bool pendingOtaInstall    = false;   // main loop runs the install (shows progress on the station)
+    bool allowanceChanged     = false;   // main loop redraws money screens
 
     void begin(const char* pin) {
         strlcpy(_pin, pin ? pin : "", sizeof(_pin));
@@ -71,6 +77,8 @@ public:
         _server.on("/api/routines", HTTP_POST, [this]() { if (_auth()) _handleSave("/config/routines.json", "routines", pendingRoutineReload); });
         _server.on("/api/tasks",    HTTP_GET,  [this]() { if (_auth()) _streamFile("/tasks/recurring.json", "{\"tasks\":[]}"); });
         _server.on("/api/tasks",    HTTP_POST, [this]() { if (_auth()) _handleSave("/tasks/recurring.json", "tasks", pendingTaskReload); });
+        _server.on("/api/allowance", HTTP_GET,  [this]() { if (_auth()) _handleAllowance(); });
+        _server.on("/api/allowance", HTTP_POST, [this]() { if (_auth()) _handleAllowanceSave(); });
         _server.on("/api/firmware",         HTTP_GET,  [this]() { if (_auth()) _handleFirmware(false); });
         _server.on("/api/firmware/check",   HTTP_POST, [this]() { if (_auth()) _handleFirmware(true); });
         _server.on("/api/firmware/install", HTTP_POST, [this]() { if (_auth()) _handleFirmwareInstall(); });
@@ -124,6 +132,23 @@ private:
         doc["ok"] = true;
         doc["installing"] = ota.latest;
         _sendJson(200, doc);
+    }
+
+    void _handleAllowance() {
+        JsonDocument doc;
+        allowance.toJson(doc);
+        _sendJson(200, doc);
+    }
+
+    void _handleAllowanceSave() {
+        if (!_server.hasArg("plain")) { _sendError(400, "empty body"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, _server.arg("plain"))) { _sendError(400, "invalid JSON"); return; }
+        const char* err = allowance.apply(doc);
+        if (err) { _sendError(400, err); return; }
+        allowanceChanged = true;
+        _server.send(200, "application/json", "{\"ok\":true}");
+        Serial.printf("[WEB] Allowance: %s\n", doc["op"] | "?");
     }
 
     void _sendError(int code, const char* msg) {
@@ -275,6 +300,16 @@ textarea{min-height:96px;resize:vertical}
 .add{background:#2c3644}.save{background:var(--ok)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:80px;background:#000a;padding:10px 16px;border-radius:8px;opacity:0;transition:.2s}
 .toast.on{opacity:1}
+.bal{font-size:30px;font-weight:800;color:var(--ok)}
+.wk{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-top:1px solid #2c3644;font-size:14px}
+.wk .d{width:64px;flex:none;font-weight:700}.wk .st{width:70px;flex:none;font-size:12px}
+.wk .its{flex:1}.wk label{display:flex;align-items:center;gap:6px;margin:0 0 4px;color:var(--txt);font-size:14px}
+.wk input[type=checkbox],.req input{width:auto}
+.req label{display:flex;align-items:center;gap:8px;color:var(--txt);font-size:14px}
+.good{color:var(--ok)}.miss{color:var(--err)}.today{color:var(--warn)}
+.hist{display:flex;gap:8px;align-items:center;padding:6px 0;border-top:1px solid #2c3644;font-size:14px}
+.hist .t{flex:1}.hist .a{font-weight:700;white-space:nowrap}
+.sm{background:#2c3644;border:none;color:#fff;padding:5px 8px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap}
 </style></head><body>
 <h1>Chore Station</h1>
 <div class="sub" id="ip"></div>
@@ -282,6 +317,7 @@ textarea{min-height:96px;resize:vertical}
   <div class="tab on" id="tabR" onclick="show('R')">Routines</div>
   <div class="tab" id="tabC" onclick="show('C')">Chores</div>
   <div class="tab" id="tabF" onclick="show('F')">Family</div>
+  <div class="tab" id="tabA" onclick="show('A')">Allowance</div>
 </div>
 <div id="listR"></div>
 <div id="exC" class="scan" style="display:none">Starting fresh? <button type="button" class="use" onclick="loadExamples()">Replace all chores with the examples</button></div>
@@ -291,7 +327,8 @@ textarea{min-height:96px;resize:vertical}
   <div id="listF"></div>
   <div class="scan" id="fw">Firmware: ...</div>
 </div>
-<div class="bar">
+<div id="paneA" style="display:none"></div>
+<div class="bar" id="bar">
   <button class="btn add" onclick="add()">+ Add</button>
   <button class="btn save" onclick="save()">Save changes</button>
 </div>
@@ -306,7 +343,7 @@ var EXAMPLE_CHORES=[{"id":1101,"name":"Clean Playroom","cat":0,"size":0,"type":0
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.className='toast on';setTimeout(function(){t.className='toast'},1800)}
-function show(t){cur=t;['R','C','F'].forEach(function(k){document.getElementById('tab'+k).className='tab'+(t==k?' on':'')});document.getElementById('listR').style.display=t=='R'?'':'none';document.getElementById('listC').style.display=t=='C'?'':'none';document.getElementById('exC').style.display=t=='C'?'':'none';document.getElementById('paneF').style.display=t=='F'?'':'none'}
+function show(t){cur=t;['R','C','F','A'].forEach(function(k){document.getElementById('tab'+k).className='tab'+(t==k?' on':'')});document.getElementById('paneA').style.display=t=='A'?'':'none';document.getElementById('bar').style.display=t=='A'?'none':'';if(t=='A')alLoad();document.getElementById('listR').style.display=t=='R'?'':'none';document.getElementById('listC').style.display=t=='C'?'':'none';document.getElementById('exC').style.display=t=='C'?'':'none';document.getElementById('paneF').style.display=t=='F'?'':'none'}
 
 // 254 = each child gets their own copy; 255 = one copy: for a chore the first
 // to start it takes it, a routine is shown to everyone (parents too).
@@ -455,6 +492,89 @@ function fwCheck(){toast('Checking GitHub...');fetch('/api/firmware/check',{meth
 function fwInstall(){
   if(!confirm('Install the update now? The station shows progress and restarts (about a minute). Chores and points are kept.'))return;
   fetch('/api/firmware/install',{method:'POST'}).then(function(r){return r.json()}).then(function(j){toast(j.ok?'Installing on the station...':'Error: '+(j.error||'?'))}).catch(function(){toast('Network error')});
+}
+// ── Allowance: every button saves straight away (no Save bar) ──
+var al=null;
+var ALST=['','good day','missed','today','not tracked yet'],ALCL=['','good','miss','today',''];
+function money(c){c=+c||0;return(c<0?'-':'')+'$'+(Math.abs(c)/100).toFixed(2)}
+function toCents(v){var n=parseFloat(String(v==null?'':v).replace(/[$,\s]/g,''));return isNaN(n)?NaN:Math.round(n*100)}
+function alName(key){var o=(al&&al.options||[]).filter(function(x){return x.key==key})[0];return o?o.name:'(deleted #'+key+')'}
+function alLoad(){return fetch('/api/allowance').then(function(r){return r.json()}).then(function(j){al=j;alRender()}).catch(function(){toast('Load failed')})}
+function alPost(body,msg){
+  return fetch('/api/allowance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json()}).then(function(j){if(j.ok){toast(msg||'Saved!');alLoad()}else toast('Error: '+(j.error||'?'))})
+    .catch(function(){toast('Network error')});
+}
+function alShortDate(s){var p=String(s||'').split('-');return p.length==3?(+p[1])+'/'+(+p[2]):s}
+function alKid(k){
+  var h='<div class="card" data-k="A" data-m="'+k.id+'"><span class="role">balance</span><h1 style="margin:0">'+esc(k.name)+'</h1>'
+   +'<div class="bal">'+money(k.balance)+'</div>';
+  h+='<label>This week ('+k.good+' good day'+(k.good==1?'':'s')+', '+al.need+' needed for '+money(al.cents)+'). Tick anything done but not tapped on the station.</label>';
+  (k.days||[]).forEach(function(d,i){
+    var editable=al.started&&i<=al.todayIdx&&al.todayIdx>=0;
+    h+='<div class="wk"><div class="d">'+DAYS[i]+' '+alShortDate(d.date)+'</div><div class="st '+ALCL[d.state]+'">'+ALST[d.state]+'</div><div class="its">';
+    if(!d.items.length)h+='<span style="color:var(--dim)">nothing required</span>';
+    d.items.forEach(function(it){
+      h+='<label><input type="checkbox" class="f-mark" data-day="'+i+'" data-key="'+it.key+'"'+(it.done?' checked':'')+(editable?'':' disabled')
+        +' onchange="alMark(this)">'+esc(alName(it.key))+'</label>';
+    });
+    h+='</div></div>';
+  });
+  h+='<label>Record money (spent or added)</label><div class="row"><div><input class="f-amt" inputmode="decimal" placeholder="$3.50"></div>'
+   +'<div style="flex:2"><input class="f-note" maxlength="39" placeholder="What for (optional)"></div></div>'
+   +'<div class="row" style="margin-top:6px"><button type="button" class="use" onclick="alMoney(this,-1)">Spent</button><button type="button" class="use" onclick="alMoney(this,1)">Added</button></div>';
+  h+='<label>History</label>';
+  var log=(k.log||[]).slice().reverse();
+  if(!log.length)h+='<div style="color:var(--dim);font-size:14px">Nothing yet - the first allowance is credited after the first full week.</div>';
+  log.forEach(function(e){
+    if(e.k=='w'){
+      var days=0;for(var b=0;b<7;b++)if((e.ok>>b)&1)days++;
+      h+='<div class="hist"><div class="t">Week of '+alShortDate(e.date)+': <span class="'+(e.paid?'good':'miss')+'">'+(e.paid?'received':'missed')+'</span> ('+days+'/7 days)'+(e.ovr?' <i>(changed by a parent)</i>':'')+'</div>'
+        +'<div class="a '+(e.paid?'good':'')+'">'+(e.paid?'+'+money(e.a):'$0')+'</div>'
+        +'<button type="button" class="sm" onclick="alOverride('+k.id+','+e.idx+','+(e.paid?'false':'true')+')">'+(e.paid?'Mark missed':'Give it')+'</button></div>';
+    }else{
+      h+='<div class="hist"><div class="t">'+alShortDate(e.date)+' '+esc(e.n||(e.a<0?'Spent':'Added'))+'</div><div class="a '+(e.a<0?'miss':'good')+'">'+(e.a>0?'+':'')+money(e.a)+'</div>'
+        +'<button type="button" class="sm" onclick="alDelete('+k.id+','+e.idx+')">Delete</button></div>';
+    }
+  });
+  h+='<label>Starting savings (bank + cash before the tracker)</label><div class="row"><div><input class="f-start" inputmode="decimal" value="'+(k.start/100).toFixed(2)+'"></div>'
+   +'<div><button type="button" class="use" style="width:100%" onclick="alStart(this)">Save starting amount</button></div></div>';
+  return h+'</div>';
+}
+function alRender(){
+  if(!al)return;
+  var h='';
+  if(!al.synced)h+='<div class="scan">The station\'s clock isn\'t set yet (it needs WiFi). Nothing is tracked until it is.</div>';
+  else if(!al.started)h+='<div class="scan">Tracking starts Sunday '+esc(al.week)+'. The first '+money(al.cents)+' is credited the Sunday after.</div>';
+  var req=(al.options||[]).filter(function(o){return o.required});
+  if(!req.length)h+='<div class="scan">Pick the required chores below - nobody earns an allowance until some are picked.</div>';
+  (al.kids||[]).forEach(function(k){h+=alKid(k)});
+  if(!(al.kids||[]).length)h+='<div class="card">No children in the family yet.</div>';
+  h+='<div class="card" id="alSet"><h1 style="margin:0 0 4px">Rules</h1>'
+   +'<div class="row"><div><label>Allowance per week</label><input class="f-cents" inputmode="decimal" value="'+(al.cents/100).toFixed(2)+'"></div>'
+   +'<div><label>Good days needed (of 7)</label><input class="f-need" type="number" min="1" max="7" value="'+al.need+'"></div></div>'
+   +'<label>Required every day they come up (a day is good when all of these are done)</label><div class="req">';
+  (al.options||[]).forEach(function(o){
+    h+='<label><input type="checkbox" class="f-req" value="'+o.key+'"'+(o.required?' checked':'')+'>'+esc(o.name)+' <span style="color:var(--dim);font-size:12px">'+o.kind+'</span></label>';
+  });
+  h+='</div><button type="button" class="btn save" style="width:100%;margin-top:8px" onclick="alSettings()">Save rules</button></div>';
+  document.getElementById('paneA').innerHTML=h;
+}
+function alCard(el){while(el&&!el.dataset.m)el=el.parentNode;return el}
+function alMark(cb){var c=alCard(cb);alPost({op:'mark',member:+c.dataset.m,day:+cb.dataset.day,key:+cb.dataset.key,done:cb.checked},cb.checked?'Marked done':'Unmarked')}
+function alMoney(b,sign){
+  var c=alCard(b),v=toCents(c.querySelector('.f-amt').value);
+  if(!(v>0)){toast('Enter an amount like 3.50');return}
+  alPost({op:'money',member:+c.dataset.m,cents:sign*v,note:c.querySelector('.f-note').value.trim()},sign<0?'Spending recorded':'Money added');
+}
+function alStart(b){var c=alCard(b),v=toCents(c.querySelector('.f-start').value);if(isNaN(v)){toast('Enter an amount like 25.00');return}alPost({op:'start',member:+c.dataset.m,cents:v})}
+function alOverride(m,idx,paid){if(!confirm(paid?'Give the allowance for this week?':'Take back this week\'s allowance?'))return;alPost({op:'override',member:m,idx:idx,paid:paid},paid?'Allowance given':'Marked missed')}
+function alDelete(m,idx){if(!confirm('Delete this money entry?'))return;alPost({op:'delete',member:m,idx:idx},'Deleted')}
+function alSettings(){
+  var s=document.getElementById('alSet'),v=toCents(s.querySelector('.f-cents').value),req=[];
+  if(isNaN(v)){toast('Enter an amount like 5.00');return}
+  s.querySelectorAll('.f-req').forEach(function(cb){if(cb.checked)req.push(+cb.value)});
+  alPost({op:'settings',cents:v,need:+s.querySelector('.f-need').value,req:req},'Rules saved');
 }
 function render(id,arr,fn){document.getElementById(id).innerHTML=arr.map(fn).join('')}
 function loadFamily(){

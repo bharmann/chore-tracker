@@ -43,6 +43,14 @@ public:
     // Called when a streak bonus is awarded at the daily reset (member, points),
     // so the UI can tell the child next time they scan. Set in setup().
     void (*onStreakBonus)(uint8_t memberId, uint8_t points) = nullptr;
+    // Called at the start of the daily reset with the date of the day that
+    // just ended (before its progress is wiped). Used by the allowance.
+    void (*onDayClosing)(const char* date) = nullptr;
+
+    // Recurring templates (the allowance looks chores up by id)
+    const Task* findTemplate(uint16_t id) const { return _findTemplate(id); }
+    uint8_t templateCount() const { return _recurringLoaded ? _recurringCount : 0; }
+    const Task& templateAt(uint8_t i) const { return _recurringTemplates[i]; }
 
     // ─── Today's counts, derived from what's saved ───────────────────────
     // Worked out from the task list (active.json) and routine masks rather
@@ -261,6 +269,9 @@ public:
 
     bool performDailyReset() {
         Serial.println("[SCHED] ═══ DAILY RESET ═══");
+
+        // 0. Let the allowance record the day that just ended
+        if (onDayClosing && _stampLoaded && _resetStamp[0]) onDayClosing(_resetStamp);
 
         // 1. Evaluate streaks for each child
         _evaluateStreaks();

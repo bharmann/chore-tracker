@@ -356,6 +356,15 @@ public:
         return n == body.length();
     }
 
+    // ─── Generic JSON files (allowance) ──────────────────────────────────
+    // Load with .bak fallback; save keeping the previous version as .bak.
+    bool loadJsonFile(const char* path, JsonDocument& doc) { return _loadJson(path, doc); }
+    bool saveJsonFile(const char* path, JsonDocument& doc) {
+        if (SD.exists(path)) copyFile(path, _bakPath(path).c_str());
+        if (SD.exists(path)) SD.remove(path);
+        return _writeJson(path, doc);
+    }
+
     bool fileExists(const char* path) { return SD.exists(path); }
 
     // ─── First-Run Setup Detection ───────────────────────────────────────

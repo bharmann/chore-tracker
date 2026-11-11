@@ -123,7 +123,8 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
 5. More chores than fit? **More >** / **< Back** right under the list
 6. Noticed something that needed doing? Tap **+ Job**: pick a category, a name (or "Type my own..."), the size. On the last screen, "This was my own idea" adds the +2 initiative bonus (off by default). **I DID IT!** sends it to a parent right away; **Do it later** just adds it to your list
 7. **Routines** (bedtime, get-ready-for-school): tap the routine card and check off each step — checking the last one finishes it. One scan, no per-step scanning. Checked steps are remembered for the day. Routines light up gold during their time of day. Edit them in the web editor (or `/config/routines.json`)
-8. Done? Tap **Bye** (bottom-left).
+8. **Money** (the green amount at the bottom of your dashboard): tap it to see how much you've saved, this week's days (green = all your required chores done, red = missed one, gold ring = today, still to do), what's still required today, and your allowance history.
+9. Done? Tap **Bye** (bottom-left).
 
 ### For Parents
 1. The home screen shows an amber **"2 to check: Ava 1 Mia 1"** bar when chores are waiting for you
@@ -132,10 +133,23 @@ See `SDCard_Contents/tasks/recurring.json` for a complete example (or just use t
 4. **+ Job** (bottom-right) = Quick Add: category, name or "Type my own...", size, and who (a child, **Per child** = one each, or **First taker**)
 5. Tap the gear icon → full admin (create recurring tasks with preset or typed names, manage tasks, rename people and adjust goals, WiFi setup)
 
+### Allowance
+Each child earns a weekly allowance (default **$5.00**) for doing the **required** chores every day. Weeks run Sunday to Saturday; when a week ends, a week with enough good days (default 7 of 7) is credited automatically, and the history records it as received or missed. A day is good when every required routine/chore that applies to that child that day is finished. Waiting for a parent's approval counts. A Redo takes it back.
+
+Everything a parent changes is in the web editor's **Allowance** tab:
+- **This week**: tick a chore a child did but forgot to tap (any day of the current week up to today).
+- **History**: **Give it** / **Mark missed** overrides a finished week either way (marked "changed by a parent").
+- **Record money**: an amount and a note, then **Spent** or **Added** (gifts, bank interest...). Money entries can be deleted if one was a mistake.
+- **Starting savings**: what each child already had (bank + cash) before the tracker.
+- **Rules**: the weekly amount, good days needed, and which routines/chores are required. On first start the station picks routines named "After School" and "Bedtime" and the chore "Brush Teeth - PM".
+
+On the station, a parent's dashboard has a **$ Money** button showing every child's balance and week (read-only). Tracking needs the clock (WiFi/NTP), and starts on the first Sunday after the update is installed. Data: `/stats/allowance.json` (previous version kept as `.bak`).
+
 ### Web editor (from your phone)
 When the station is on WiFi, the home screen shows a URL like `http://192.168.1.50`. Open it in any browser on the same network to edit:
 - **Chores** and **routines**, with a real keyboard: custom names, schedules, steps, points, assignees.
 - **Family**: names, daily goals, and tag IDs. "Use last scan" fills in the most recent unregistered tag.
+- **Allowance**: balances, this week, history, overrides, spending, rules (see above).
 
 Saves write straight to the SD card and apply live (no reboot): today's not-yet-started copies of a chore are updated to match its edit, or removed if the chore was deleted; started and waiting-for-approval chores are left alone. Chores and routines are the same files you could hand-edit: `/tasks/recurring.json` and `/config/routines.json`. Existing items keep their ids when you save, so today's progress isn't disturbed.
 
@@ -153,7 +167,7 @@ Once a station runs firmware with update support (flash that one by USB), later 
 
 1. **Publish:** on GitHub (the mobile app works too) open Actions → *Release* → **Run workflow** and type the version, e.g. `v1.4.0`; it releases the latest `main`. Or push a tag: `git tag v1.4.0 && git push origin v1.4.0`. The *Release* workflow builds the firmware and creates a GitHub release with `ChoreStation.bin`, `version.json` (version, size, SHA-256) and `ChoreStation-full.bin` (for a USB flash at 0x0). Use a higher number every time (v1.4.0 → v1.4.1 → v1.5.0).
 2. **Notice:** the station checks the latest release every 6 hours while idle (and at Admin → System Info → *Check for update*). When a newer one exists the parent dashboard's gear says **Update!** and System Info shows "(v1.4.1 ready)".
-3. **Install (a parent):** Admin → System Info → **Install update** → tap again to confirm, or the web editor's Family tab → *Install*. The station saves everything, shows progress, checks the download's size and SHA-256, and restarts. Chores, points and settings (all on the SD card) are kept.
+3. **Install:** the station installs a new release by itself between 2 and 4 am when nobody has touched it for 10 minutes (one try per night). A parent can also install any time: Admin → System Info → **Install update** → tap again to confirm, or the web editor's Family tab → *Install*. The station saves everything, shows progress, checks the download's size and SHA-256, and restarts. Chores, points and settings (all on the SD card) are kept.
 4. **Safety net:** the new firmware has to run normally for a minute (SD card readable) before it's kept. If it crashes, is unplugged in that minute, or can't read the card, the station goes back to the previous firmware by itself. A failed download leaves the running firmware untouched.
 
 Builds from the Arduino IDE report version `dev`, which counts as older than any release.

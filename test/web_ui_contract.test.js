@@ -4,6 +4,7 @@ const { JSDOM } = require('jsdom');
 const ROOT = require('path').join(__dirname, '..');
 const web = fs.readFileSync(ROOT + '/ChoreStation/web_server.h', 'utf8');
 const storage = fs.readFileSync(ROOT + '/ChoreStation/storage_manager.h', 'utf8');
+const allowanceSrc = fs.readFileSync(ROOT + '/ChoreStation/allowance_manager.h', 'utf8');
 const seedRoutines = JSON.parse(fs.readFileSync(ROOT + '/SDCard_Contents/config/routines.json', 'utf8'));
 const seedTasks = JSON.parse(fs.readFileSync(ROOT + '/SDCard_Contents/tasks/recurring.json', 'utf8'));
 
@@ -24,16 +25,45 @@ const family = { members: [
 const lastScan = { uid: '04:11:22:33:44:55:66', ageSec: 4 };
 
 let posted = {};   // captured POST bodies by path
+let allowancePosts = [];   // every POST /api/allowance body, in order
+
+// What GET /api/allowance returns (shape from AllowanceManager::toJson)
+const dayItems = (done) => [{ key: 60002, done }, { key: 1103, done }];
+const allowanceFix = {
+  cents: 500, need: 7, synced: true, started: true, week: '2026-11-15', today: '2026-11-17', todayIdx: 2,
+  options: [
+    { key: 60002, name: 'Bedtime', kind: 'Routine', days: 127, required: true },
+    { key: 1103, name: 'Brush Teeth - PM', kind: 'Chore', days: 127, required: true },
+    { key: 1104, name: 'Set <the> table', kind: 'Chore', days: 127, required: false },
+  ],
+  kids: [
+    { id: 2, name: 'Ada', balance: 3250, start: 2500, good: 1, days: [
+      { date: '2026-11-15', state: 1, items: dayItems(true) },
+      { date: '2026-11-16', state: 2, items: [{ key: 60002, done: true }, { key: 1103, done: false }] },
+      { date: '2026-11-17', state: 3, items: dayItems(false) },
+      { date: '2026-11-18', state: 0, items: dayItems(false) },
+      { date: '2026-11-19', state: 0, items: dayItems(false) },
+      { date: '2026-11-20', state: 0, items: dayItems(false) },
+      { date: '2026-11-21', state: 0, items: dayItems(false) },
+    ], log: [
+      { k: 'w', day: 20400, date: '2026-11-08', ok: 127, paid: true, amt: 500, a: 500, idx: 0 },
+      { k: 'm', day: 20404, date: '2026-11-12', a: -300, n: 'Toy <car>', idx: 1 },
+    ] },
+    { id: 3, name: 'Bea <b>', balance: 0, start: 0, good: 0, days: [], log: [] },
+  ],
+};
 
 function mockFetch(url, opts) {
   let body;
   if (opts && opts.method === 'POST') {
     posted[url] = JSON.parse(opts.body);
+    if (url === '/api/allowance') allowancePosts.push(posted[url]);
     body = { ok: true };
   } else if (url === '/api/family') body = family;
   else if (url === '/api/routines') body = seedRoutines;
   else if (url === '/api/tasks') body = seedTasks;
   else if (url === '/api/lastscan') body = lastScan;
+  else if (url === '/api/allowance') body = allowanceFix;
   else body = {};
   return Promise.resolve({ json: () => Promise.resolve(body) });
 }
@@ -220,9 +250,72 @@ setTimeout(() => {
         ok('family POST has every key the server reads (' + serverKeys.join(',') + ')',
            pf && serverKeys.every(k => k in pf.members[0]) && keys.every(k => k in pf.members[0]));
 
-        console.log('\n' + pass + ' passed, ' + fail + ' failed');
-        process.exit(fail ? 1 : 0);
+        runAllowance();
       }, 20);
     }, 20);
   }, 20);
 }, 60);
+
+// ── Allowance tab: renders the station's data, and every action posts the
+// keys AllowanceManager::apply() reads ──
+function runAllowance() {
+  console.log('\n[allowance tab]');
+  const d = w.document;
+  w.confirm = () => true;
+  w.show('A');
+  setTimeout(() => {
+    const pane = d.getElementById('paneA');
+    ok('allowance pane visible, save bar hidden', pane.style.display === '' && d.getElementById('bar').style.display === 'none');
+    const cards = pane.querySelectorAll('.card[data-m]');
+    ok('one card per child', cards.length === 2);
+    ok('balance shown as dollars', /\$32\.50/.test(cards[0].innerHTML));
+    ok('history shows received week + spending', /received/.test(cards[0].innerHTML) && /-\$3\.00/.test(cards[0].innerHTML));
+    ok('notes and names are HTML-escaped', /Toy &lt;car&gt;/.test(cards[0].innerHTML) && /Bea &lt;b&gt;/.test(pane.innerHTML) && /Set &lt;the&gt; table/.test(pane.innerHTML));
+    ok('required chores named on each day', /Brush Teeth - PM/.test(cards[0].innerHTML));
+    const marks = cards[0].querySelectorAll('.f-mark');
+    const future = [...marks].filter(m => +m.dataset.day > 2);
+    const past = [...marks].filter(m => +m.dataset.day <= 2);
+    ok('future days can\'t be ticked, past ones can', future.length > 0 && future.every(m => m.disabled) && past.every(m => !m.disabled));
+    ok('starting savings shown in dollars', cards[0].querySelector('.f-start').value === '25.00');
+
+    // Actions
+    const missing = [...marks].find(m => m.dataset.day === '1' && m.dataset.key === '1103');
+    missing.checked = true; w.alMark(missing);
+    cards[0].querySelector('.f-amt').value = '$3.50';
+    cards[0].querySelector('.f-note').value = 'Candy';
+    w.alMoney(cards[0].querySelector('.f-amt'), -1);
+    cards[0].querySelector('.f-start').value = '40';
+    w.alStart(cards[0].querySelector('.f-start'));
+    w.alOverride(2, 0, false);
+    w.alDelete(2, 1);
+    const set = d.getElementById('alSet');
+    set.querySelector('.f-cents').value = '6';
+    set.querySelector('.f-need').value = '6';
+    set.querySelectorAll('.f-req').forEach(cb => { cb.checked = cb.value === '1104' || cb.value === '60002'; });
+    w.alSettings();
+
+    setTimeout(() => {
+      const by = op => allowancePosts.find(p => p.op === op) || {};
+      const mk = by('mark');
+      ok('mark posts member/day/key/done', mk.member === 2 && mk.day === 1 && mk.key === 1103 && mk.done === true);
+      const mo = by('money');
+      ok('spending posts negative cents + note', mo.member === 2 && mo.cents === -350 && mo.note === 'Candy');
+      ok('starting savings posts cents', by('start').cents === 4000);
+      const ov = by('override');
+      ok('override posts week idx + paid', ov.member === 2 && ov.idx === 0 && ov.paid === false);
+      ok('delete posts entry idx', by('delete').idx === 1);
+      const st = by('settings');
+      ok('rules post cents/need/req', st.cents === 600 && st.need === 6 && st.req.slice().sort().join() === '1104,60002');
+
+      const fwKeys = [...new Set([...allowanceSrc.matchAll(/in\["(\w+)"\]/g)].map(x => x[1]))];
+      const sent = new Set(allowancePosts.flatMap(p => Object.keys(p)));
+      const notSent = fwKeys.filter(k => !sent.has(k));
+      ok('every key apply() reads is sent by some action (' + notSent.join(',') + ')', fwKeys.length > 5 && notSent.length === 0);
+      const extra = [...sent].filter(k => !fwKeys.includes(k));
+      ok('no action sends a key apply() ignores (' + extra.join(',') + ')', extra.length === 0);
+
+      console.log('\n' + pass + ' passed, ' + fail + ' failed');
+      process.exit(fail ? 1 : 0);
+    }, 40);
+  }, 40);
+}
